@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# webapp-chrome URL — open URL as an app window in Google Chrome.
+# Omarchy's own web-app launcher can't (it misreads Chrome's desktop entry and
+# Firefox, the default browser, can't do app windows). Added 2026-11-11.
+[[ -n ${1:-} ]] || { echo "usage: webapp-chrome URL" >&2; exit 1; }
+if ! omarchy-cmd-browser-handoff google-chrome-stable --app="$1" "${@:2}" 2>/dev/null; then
+  exec setsid uwsm-app -- google-chrome-stable --app="$1" "${@:2}"
+fi

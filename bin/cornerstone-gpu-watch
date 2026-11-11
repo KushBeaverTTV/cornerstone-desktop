@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Cornerstone GPU watch.
+#   cornerstone-gpu-watch report   print what dictation is using right now
+#   cornerstone-gpu-watch check    notify if something looks wrong (run by a timer)
+#
+# Alerts (each at most once per 30 minutes):
+#   - dictation's own GPU memory has grown past its limit (config .gpu_limit_mb, default 6000)
+#   - the card's memory is nearly full (config .gpu_full_pct, default 90)
+#   - the last three dictations were all far slower than normal (GPU is busy elsewhere)
+set -u
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/dictation-cornerstone/config.json"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-dictation-cornerstone"
+cfg() { jq -r "$1" "$CONFIG" 2>/dev/null; }
+
+card=""
+for c in /sys/class/drm/card?; do [[ -r $c/device/mem_info_vram_total ]] && card=$c/device && break; done
+[[ -n $card ]] || { echo "no GPU memory counters found" >&2; exit 1; }
+total=$(( $(cat "$card/mem_info_vram_total") / 1048576 ))
+used=$(( $(cat "$card/mem_info_vram_used") / 1048576 ))
+busy=$(cat "$card/gpu_busy_percent" 2>/dev/null || echo "?")
+
+# vram_mb UNIT -> GPU memory of that service's process, MB (0 if not running)
+vram_mb() {
+  local pid
+  pid=$(systemctl --user show -p MainPID --value "$1" 2>/dev/null)
+  [[ ${pid:-0} -gt 0 ]] || { echo 0; return; }
+  cat /proc/"$pid"/fdinfo/* 2>/dev/null | awk '/^drm-client-id/{id=$2} /^drm-total-vram/{v[id]=$2} END{s=0; for(i in v) s+=v[i]; printf "%d\n", s/1024}'
+}
+ram_mb() {
+  local pid
+  pid=$(systemctl --user show -p MainPID --value "$1" 2>/dev/null)
+  [[ ${pid:-0} -gt 0 ]] && awk '/VmRSS/{printf "%d\n", $2/1024}' /proc/"$pid"/status || echo 0
+}
+qv=$(vram_mb cornerstone-stt-qwen.service); wv=$(vram_mb cornerstone-stt-gpu.service)
+qr=$(ram_mb cornerstone-stt-qwen.service); wr=$(ram_mb cornerstone-stt-gpu.service); cr=$(ram_mb cornerstone-stt.service)
+mine=$(( qv + wv ))
+
+alert() { # KEY TITLE BODY — at most once per 30 minutes per key
+  local stamp="$STATE/gpu-alert-$1"
+  if [[ -f $stamp ]] && (( $(date +%s) - $(stat -c %Y "$stamp") < 1800 )); then return 0; fi
+  touch "$stamp"
+  printf '%s gpu-watch: %s — %s\n' "$(date '+%F %T')" "$2" "$3" >>"$STATE/last.log"
+  notify-send -u normal -a Cornerstone "$2" "$3" 2>/dev/null
+}
+
+case "${1:-report}" in
+  report)
+    printf 'GPU memory:  dictation %d MB of %d MB (%d%%)  — Qwen %d MB, Whisper %d MB\n' "$mine" "$total" $(( mine * 100 / total )) "$qv" "$wv"
+    printf 'Whole card:  %d MB in use (%d%%), %s%% busy right now\n' "$used" $(( used * 100 / total )) "$busy"
+    printf 'System RAM:  dictation %d MB  — Qwen %d, Whisper %d, CPU fallback %d\n' $(( qr + wr + cr )) "$qr" "$wr" "$cr"
+    ;;
+  check)
+    limit=$(cfg '.gpu_limit_mb // 6000'); full=$(cfg '.gpu_full_pct // 90')
+    if (( mine > limit )); then
+      alert grow "Cornerstone is using more GPU memory than normal" "$mine MB now; normal is about 4200 MB. Restarting the speech services will reset it."
+    fi
+    if (( used * 100 / total >= full )); then
+      alert full "GPU memory is nearly full" "$used of $total MB in use. Dictation holds $mine MB of that; switching the engine to Whisper only frees about $qv MB."
+    fi
+    # Slow dictations: last three takes all above 60 ms per word and 2 s
+    # (normal is roughly 10 ms per word).
+    slow=$(grep -E ' ok: [0-9]+ words \(stt [0-9]+ ms' "$STATE/last.log" 2>/dev/null | tail -3 | sed -E 's/.* ok: ([0-9]+) words \(stt ([0-9]+) ms.*/\1 \2/' | awk '$1 > 0 && $2 > 2000 && $2 / $1 > 60 {n++} END{print n+0}')
+    last=$(grep -E ' ok: [0-9]+ words' "$STATE/last.log" 2>/dev/null | tail -1 | cut -c1-19)
+    if (( slow == 3 )) && [[ -n $last ]] && (( $(date +%s) - $(date -d "$last" +%s) < 600 )); then
+      alert slow "Dictation is running slow" "The last three dictations took far longer than normal. Something else is probably loading the GPU ($busy% busy now)."
+    fi
+    ;;
+  *) echo "usage: cornerstone-gpu-watch report|check" >&2; exit 2 ;;
+esac

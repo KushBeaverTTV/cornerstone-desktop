@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# app-summon — one window per app, always findable.
+#
+#   app-summon <class-regex> <launch command...>
+#       Window open anywhere (other workspace, hidden scratchpad)? Bring it to
+#       the workspace you are on and focus it; extra copies are closed.
+#       Not open? Launch it.
+#   app-summon --close <class-regex>     close every window of that app
+#   app-summon --count <class-regex>     print how many windows it has
+#   app-summon --hide <class-regex>      park it in the hidden scratchpad
+#
+# Written 2026-11-11 for the Discord, Muse and Cornerstone HQ bar widgets.
+set -u
+
+windows() {  # addresses matching the class regex, most recently used first
+  hyprctl clients -j 2>/dev/null | jq -r --arg p "$1" \
+    '[.[] | select((.class | test($p; "i")) or (.initialClass | test($p; "i")))] | sort_by(.focusHistoryID) | .[].address'
+}
+dispatch() { hyprctl dispatch "$1" >/dev/null 2>&1; }
+
+case "${1:-}" in
+  --close)
+    for a in $(windows "$2"); do dispatch "hl.dsp.window.close({ window = \"address:$a\" })"; done ;;
+  --count)
+    windows "$2" | grep -c . ;;
+  --hide)
+    for a in $(windows "$2"); do dispatch "hl.dsp.window.move({ workspace = \"special:minimized\", follow = false, window = \"address:$a\" })"; done ;;
+  ""|-h|--help)
+    sed -n '2,13p' "$0"; exit 1 ;;
+  *)
+    pattern=$1; shift
+    mapfile -t found < <(windows "$pattern")
+    if (( ${#found[@]} == 0 )); then
+      (( $# > 0 )) || { echo "app-summon: nothing open and no launch command" >&2; exit 1; }
+      setsid "$@" >/dev/null 2>&1 &
+      exit 0
+    fi
+    keep=${found[0]}
+    for a in "${found[@]:1}"; do dispatch "hl.dsp.window.close({ window = \"address:$a\" })"; done
+    ws=$(hyprctl activeworkspace -j | jq -r '.id')
+    cur=$(hyprctl clients -j | jq -r --arg a "$keep" '.[] | select(.address == $a) | .workspace.id')
+    [[ $cur != "$ws" ]] && dispatch "hl.dsp.window.move({ workspace = \"$ws\", follow = false, window = \"address:$keep\" })"
+    dispatch "hl.dsp.focus({ window = \"address:$keep\" })" || hyprctl dispatch focuswindow "address:$keep" >/dev/null ;;
+esac

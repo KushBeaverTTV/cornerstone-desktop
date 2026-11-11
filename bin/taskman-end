@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# taskman-end PID [--force]
+# Task-Manager "End task" for the stats panel: ends every process of yours that
+# runs the same program as PID (so "chrome ×24" ends all of Chrome).
+# Polite SIGTERM by default, SIGKILL with --force. Never touches the desktop's
+# own core processes or anything owned by another user. Added 2026-11-11.
+set -u
+pid=${1:-}; sig=TERM; [[ ${2:-} == --force ]] && sig=KILL
+[[ $pid =~ ^[0-9]+$ ]] && (( pid > 1 )) || { echo "usage: taskman-end PID [--force]" >&2; exit 1; }
+[[ -d /proc/$pid ]] || { notify-send -a "Task manager" "Already gone" "That process has ended."; exit 0; }
+[[ $(stat -c %u /proc/"$pid") == "$(id -u)" ]] || { notify-send -a "Task manager" "Not yours" "That process belongs to the system; it can't be ended from here."; exit 1; }
+
+comm=$(cat /proc/"$pid"/comm 2>/dev/null)
+exe=$(readlink /proc/"$pid"/exe 2>/dev/null)
+# Core of the desktop session: ending these logs you out or kills sound/bar.
+protect='^(Hyprland|hyprland|quickshell|qs|omarchy-shell|systemd|dbus-daemon|dbus-broker|pipewire|pipewire-pulse|wireplumber|Xwayland|uwsm|sddm|xdg-desktop-por|hypridle|hyprlock|polkit|gnome-keyring-d)$'
+if [[ $comm =~ $protect || $(basename "${exe:-x}") =~ $protect ]]; then
+  notify-send -a "Task manager" "Not ending $comm" "It's part of the desktop itself; ending it would break your session."
+  exit 1
+fi
+
+# Scripts all share their interpreter's exe (every Python program is
+# /usr/bin/python3), so for those only exact copies of the same command count.
+interp='^(python[0-9.]*|bash|sh|zsh|dash|node|perl|ruby|java|dotnet|lua[0-9.]*|uv)$'
+cmd=$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null)
+by_cmd=0; [[ $(basename "${exe:-x}") =~ $interp ]] && by_cmd=1
+targets=()
+for p in /proc/[0-9]*; do
+  p=${p#/proc/}
+  [[ $(stat -c %u /proc/"$p" 2>/dev/null) == "$(id -u)" ]] || continue
+  if (( by_cmd )); then [[ $(tr '\0' ' ' </proc/"$p"/cmdline 2>/dev/null) == "$cmd" ]] || continue
+  elif [[ -n $exe ]]; then [[ $(readlink /proc/"$p"/exe 2>/dev/null) == "$exe" ]] || continue
+  else [[ $(cat /proc/"$p"/comm 2>/dev/null) == "$comm" ]] || continue; fi
+  targets+=("$p")
+done
+(( ${#targets[@]} )) || targets=("$pid")
+kill -"$sig" "${targets[@]}" 2>/dev/null
+sleep 1.5
+left=0; for p in "${targets[@]}"; do [[ -d /proc/$p ]] && left=$((left + 1)); done
+if (( left == 0 )); then
+  notify-send -a "Task manager" "Ended $comm" "${#targets[@]} process(es) closed."
+elif [[ $sig == TERM ]]; then
+  notify-send -a "Task manager" "$comm is still running" "$left of ${#targets[@]} didn't close. Use Force kill to end it now."
+else
+  notify-send -a "Task manager" "$comm didn't end" "$left process(es) are stuck (often waiting on a drive or the GPU)."
+fi

@@ -1,0 +1,6 @@
+[Unit]
+Description=Cornerstone GPU watch (alerts if dictation uses too much GPU or runs slow)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/cornerstone-gpu-watch check

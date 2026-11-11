@@ -1,0 +1,20 @@
+[Unit]
+Description=Cornerstone GPU STT (whisper.cpp Vulkan, large-v3-turbo) on RX 7900 XT
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/storage/files/dictation
+ExecStart=/mnt/storage/files/dictation/whisper.cpp/build/bin/whisper-server -m /mnt/storage/files/dictation/models/ggml-large-v3-turbo.bin --host 127.0.0.1 --port 29334 -t 8 -vm /mnt/storage/files/dictation/models/ggml-silero-v6.2.0.bin
+Restart=on-failure
+RestartSec=3
+MemoryMax=8G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+DevicePolicy=closed
+DeviceAllow=/dev/dri/renderD128 rw
+DeviceAllow=/dev/dri/renderD129 rw
+
+[Install]
+WantedBy=default.target

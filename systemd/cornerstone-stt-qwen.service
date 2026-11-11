@@ -1,0 +1,20 @@
+[Unit]
+Description=Cornerstone Qwen3-ASR 1.7B speech server (transcribe.cpp, Vulkan) on RX 7900 XT
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/storage/files/dictation
+ExecStart=/mnt/storage/files/dictation/qwen-server/cornerstone-qwen-server /mnt/storage/files/dictation/models/qwen/Qwen3-ASR-1.7B-Q8_0.gguf 29335
+Restart=on-failure
+RestartSec=3
+MemoryMax=3G
+MemorySwapMax=256M
+NoNewPrivileges=true
+ProtectHome=read-only
+DevicePolicy=closed
+DeviceAllow=/dev/dri/renderD128 rw
+DeviceAllow=/dev/dri/renderD129 rw
+
+[Install]
+WantedBy=default.target

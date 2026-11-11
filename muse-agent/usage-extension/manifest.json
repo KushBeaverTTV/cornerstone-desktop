@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Muse Usage for Omarchy",
+  "version": "1.0.0",
+  "description": "Reads your Muse quota from muse.ai settings and shows it in the Omarchy bar. Sends nothing anywhere else.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxOofA+ZviGmOvRsrgTVwNVX/NbIx1IDOqlKvCwNpF7mdg0T+69TVUUI1JAu6pLaRy5EG9BuHvRML//99b+2QAdeFPG7vPBOHR114JXN/M1XsYDV/o+Ea7kLlPoiqAg3MyWbEg25xQzYkHAq8DKNCDu0xBqy2WHtK9cgbU6ZgJL3p3My4wwO/v6nHE978QCZiPHw2xu0Vc47d+AsCaFEtHrFwBqOv7g4WyKzgNL7cx1QD22kCxV02gpHQdnLVEKSabh6ql5Z86Y83q5+nGQ9sfmSDBivprW8dtls8lxNnhf65O761uxvl9+p++ydDjnhiS0FWv2V5GDh667puN6b7awIDAQAB",
+  "permissions": ["nativeMessaging"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{ "matches": ["https://muse.ai/*"], "js": ["content.js"], "run_at": "document_idle" }]
+}

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# discord-ctl — drive the one Discord window from the bar or a keybind.
+#   open     bring the open Discord here (closing extra copies) or launch it
+#   hide     park it in the hidden scratchpad     close   close it
+#   mute     toggle mic mute   (sends Discord's own Ctrl+Shift+M to its window)
+#   deafen   toggle deafen     (Ctrl+Shift+D)
+#   flip-mute / flip-deafen   correct the bar indicator only, sends nothing
+#   state    print {"open":N,"muted":bool,"deafened":bool}
+# Discord's web app cannot report its mute state, so the indicator is what the
+# widget last sent; clicks inside Discord itself are not seen.
+set -u
+P='^(brave|chrome|chromium)-discord\.com__.*$|^discord$'
+SF="${XDG_STATE_HOME:-$HOME/.local/state}/discord-widget/state"
+mkdir -p "${SF%/*}"; [[ -s $SF ]] || echo '{"muted":false,"deafened":false}' >"$SF"
+flip() { local t; t=$(mktemp "$SF.XXXX") && jq ".$1 = (.$1 | not)" "$SF" >"$t" && mv -f "$t" "$SF"; }
+win() { hyprctl clients -j | jq -r --arg p "$P" '[.[] | select((.class|test($p;"i")) or (.initialClass|test($p;"i")))] | sort_by(.focusHistoryID) | .[0].address // empty'; }
+send() {
+  local a; a=$(win); [[ -n $a ]] || { notify-send -a Discord "Discord isn't open" "Open it first, then mute or deafen."; exit 1; }
+  hyprctl dispatch "hl.dsp.send_shortcut({ mods = \"CTRL SHIFT\", key = \"$1\", window = \"address:$a\" })" >/dev/null
+}
+case "${1:-}" in
+  open) exec app-summon "$P" webapp-chrome https://discord.com/channels/@me ;;
+  hide) exec app-summon --hide "$P" ;;
+  close) exec app-summon --close "$P" ;;
+  mute) send M && flip muted ;;
+  deafen) send D && flip deafened ;;
+  flip-mute) flip muted ;;
+  flip-deafen) flip deafened ;;
+  state) jq -c --argjson n "$(app-summon --count "$P")" '{open:$n, muted:.muted, deafened:.deafened}' "$SF" ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac

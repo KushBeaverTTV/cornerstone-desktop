@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# muse-ctl — Meta Muse Agent (muse.ai) as one app window.
+#   open | usage | hide | close | state
+# "usage" opens Muse's settings page (muse.ai/subscriptions), where the quota is shown; the Muse Usage
+# Chrome add-on reads it there and saves it for the bar widget.
+set -u
+P='^chrome-(muse\.ai|agent\.meta\.ai)__.*$'
+UF="${XDG_STATE_HOME:-$HOME/.local/state}/muse-widget/usage.json"
+case "${1:-}" in
+  open) exec app-summon "$P" webapp-chrome https://muse.ai/ ;;
+  usage)
+    if [[ $(app-summon --count "$P") -gt 0 ]]; then app-summon "$P"; fi
+    exec webapp-chrome https://muse.ai/subscriptions ;;
+  hide) exec app-summon --hide "$P" ;;
+  close) exec app-summon --close "$P" ;;
+  state)
+    n=$(app-summon --count "$P")
+    if [[ -s $UF ]] && jq -e . "$UF" >/dev/null 2>&1; then jq -c --argjson n "$n" '. + {open:$n}' "$UF"
+    else printf '{"open":%d}\n' "$n"; fi ;;
+  *) sed -n '2,6p' "$0"; exit 1 ;;
+esac

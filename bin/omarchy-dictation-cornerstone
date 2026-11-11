@@ -1,0 +1,657 @@
+#!/usr/bin/env bash
+# Cornerstone dictation backend.
+# Speech: Qwen3-ASR 1.7B (cornerstone-stt-qwen.service) with Whisper large-v3-turbo
+# (cornerstone-stt-gpu.service) as referee and fallback; optional Mistral polish.
+#
+#   omarchy-dictation-cornerstone start | stop | toggle
+#   omarchy-dictation-cornerstone polish-on | polish-off
+#   omarchy-dictation-cornerstone style natural|chat|email|code
+#   omarchy-dictation-cornerstone engine local|mistral
+#   omarchy-dictation-cornerstone config            print config.json
+#   omarchy-dictation-cornerstone transcribe-file F transcribe + polish a WAV, print it, type nothing
+#
+# Pipeline: pw-record (16 kHz mono WAV) -> local STT service (127.0.0.1:29333)
+# [fallback: Mistral /v1/audio/transcriptions] -> optional /v1/chat/completions
+# polish -> wtype (wl-copy fallback).
+# Files: ~/.config/omarchy/dictation-cornerstone/{api_key,config.json,vocabulary.txt,polish-system.txt}
+#        ~/.local/state/omarchy-dictation-cornerstone/{status,last_text,last_raw,last.log,record.pid}
+set -u
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/dictation-cornerstone"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-dictation-cornerstone"
+CONFIG="$CONF_DIR/config.json"
+KEY_FILE="$CONF_DIR/api_key"
+PID_FILE="$STATE_DIR/record.pid"
+WAV="$STATE_DIR/recording.wav"
+API="https://api.mistral.ai/v1"
+mkdir -p "$STATE_DIR"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$STATE_DIR/last.log"; }
+set_status() { printf '%s\n' "$1" >"$STATE_DIR/status"; }
+cfg() { jq -r "$1" "$CONFIG" 2>/dev/null; }
+
+api_key() {
+  local k=""
+  [[ -s $KEY_FILE ]] && k=$(tr -d ' \t\r\n' <"$KEY_FILE")
+  [[ -z $k ]] && k="${MISTRAL_API_KEY:-}"
+  printf '%s' "$k"
+}
+
+is_recording() {
+  [[ -f $PID_FILE ]] || return 1
+  local pid
+  pid=$(cat "$PID_FILE" 2>/dev/null)
+  [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null
+}
+
+notify() { command -v notify-send >/dev/null && notify-send -u low -a Cornerstone "$1" "${2:-}" 2>/dev/null; return 0; }
+
+# play_cue start|stop — short audio feedback, config .sounds (default on).
+play_cue() {
+  [[ $(cfg '(.sounds | if . == null then true else . end)') == true ]] || return 0
+  local f="$CONF_DIR/sounds/$1.wav"
+  [[ -f $f ]] && command -v pw-play >/dev/null && pw-play --volume 0.7 "$f" >/dev/null 2>&1
+  return 0
+}
+
+# vocab_prompt -> initial-prompt text for whisper.cpp, built from the
+# vocabulary file (non-comment lines, comma-separated terms, first terms
+# are the proper nouns). Capped so it stays a light bias, not a script.
+vocab_terms() {
+  grep -v '^[[:space:]]*#' "$CONF_DIR/vocabulary.txt" 2>/dev/null | grep -v '^[[:space:]]*$' | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -40 | paste -sd ',' - | sed 's/,/, /g'
+}
+vocab_prompt() {
+  local terms
+  terms=$(grep -v '^[[:space:]]*#' "$CONF_DIR/vocabulary.txt" 2>/dev/null | grep -v '^[[:space:]]*$' | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | head -40 | paste -sd ',' - | sed 's/,/, /g')
+  printf 'Terms in this dictation may include: %s.' "$terms"
+}
+
+# transcribe_gpu FILE -> raw text on stdout; returns non-zero on failure.
+# whisper.cpp whisper-server (Vulkan GPU) via multipart /inference.
+transcribe_gpu() {
+  local url resp lang
+  url=$(cfg '.stt_gpu_url // "http://127.0.0.1:29334/inference"')
+  lang=$(cfg '.language // empty')
+  # Greedy by default. Beam search (config .stt_beam = 5) was a wash on the
+  # turbo model in testing: fixed some words, broke others, lost punctuation.
+  local beam
+  beam=$(cfg '.stt_beam // 1')
+  local args=(-sS --max-time 180 -F "file=@$1" -F "response_format=json" -F "temperature=0" -F "beam_size=$beam" -F "prompt=$(vocab_prompt)")
+  [[ -n $lang && $lang != null ]] && args+=(-F "language=$lang")
+  resp=$(curl "${args[@]}" "$url") || { log "transcribe-gpu: curl failed (service down?)"; return 1; }
+  if ! jq -e '.text' >/dev/null 2>&1 <<<"$resp"; then
+    log "transcribe-gpu: server error: $(head -c 300 <<<"$resp")"
+    return 1
+  fi
+  local text
+  text=$(jq -r '.text' <<<"$resp")
+  # Whisper invents short phrases ("Thank you.") for audio with no speech in
+  # it. A short result is double-checked with the speech detector (Silero
+  # VAD, loaded by the service): if it hears no speech, there is no text.
+  if (( $(wc -w <<<"$text") <= 6 )); then
+    local vresp
+    vresp=$(curl -sS --max-time 60 -F "file=@$1" -F "response_format=json" -F "temperature=0" -F "vad=true" \
+      -F "vad_threshold=0.4" -F "vad_min_speech_duration_ms=160" "$url" 2>/dev/null)
+    if jq -e '.text' >/dev/null 2>&1 <<<"$vresp" && [[ -z $(jq -r '.text' <<<"$vresp" | tr -d '[:space:]') ]]; then
+      log "no speech detected (model guessed: $(tr -d '\n' <<<"$text" | head -c 80)), nothing typed"
+      return 0
+    fi
+  fi
+  printf '%s' "$text"
+}
+
+# transcribe_qwen FILE -> raw text on stdout; non-zero on failure.
+# Qwen3-ASR 1.7B, kept loaded by cornerstone-stt-qwen.service. Request is one
+# line "path<TAB>term list"; the model uses the terms while it listens.
+transcribe_qwen() {
+  local port fd out
+  port=$(cfg '.stt_qwen_port // 29335')
+  { exec {fd}<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null || { log "transcribe-qwen: service not reachable"; return 1; }
+  printf '%s\t%s\n' "$1" "$(vocab_terms | tr -d '\t\n')" >&"$fd"
+  out=$(timeout 120 cat <&"$fd")
+  exec {fd}>&-
+  if [[ $out == ERR:* ]]; then log "transcribe-qwen: $out"; return 1; fi
+  printf '%s' "$out"
+}
+
+# pick_transcript QWEN WHISPER -> first line "Q <reason>" or "W <reason>".
+# Qwen hears names better, but it is a language model: on unclear audio it can
+# skip a stretch of speech, invent a sentence, loop, or recite the term list.
+# Whisper heard the same audio, so it is the referee. Qwen is only used when
+# the two broadly agree.
+pick_transcript() {
+  TERMS=$(vocab_terms) perl -CSD -Mutf8 -e '
+    use List::Util qw(max);
+    my ($q, $w) = @ARGV;
+    sub words { my $t = lc shift; $t =~ s/[^\w\x27 ]+/ /g; grep { length } split /\s+/, $t }
+    my @q = words($q); my @w = words($w);
+    if (!@q) { print "W qwen returned nothing\n"; exit }
+    # reciting the term list: any four neighbouring terms appear in order
+    my @t = map { join " ", words($_) } split /,/, $ENV{TERMS} // "";
+    my $qn = join " ", @q; my $wn = join " ", @w;
+    for my $i (0 .. $#t - 3) {
+      my $run = join " ", @t[$i .. $i + 3];
+      if (index($qn, $run) >= 0 && index($wn, $run) < 0) { print "W qwen recited the term list\n"; exit }
+    }
+    # looping: the same three words four times or more, and more than Whisper has
+    my (%gq, %gw);
+    $gq{"@q[$_ .. $_ + 2]"}++ for 0 .. $#q - 2; $gw{"@w[$_ .. $_ + 2]"}++ for 0 .. $#w - 2;
+    for (keys %gq) { if ($gq{$_} >= 4 && $gq{$_} > 2 * ($gw{$_} // 0)) { print "W qwen is repeating itself\n"; exit } }
+    if (!@w) { print "Q no whisper result to compare\n"; exit }
+    if (@w >= 6 || @q >= 6) {
+      if (@q * 100 < @w * 75)       { printf "W qwen dropped speech (%d words vs %d)\n", scalar @q, scalar @w; exit }
+      if (@q * 100 > @w * 130 + 300) { printf "W qwen added speech (%d words vs %d)\n", scalar @q, scalar @w; exit }
+      # share of words the two have in common, in order
+      my @prev = (0) x (@w + 1);
+      for my $i (1 .. @q) {
+        my @cur = (0);
+        for my $j (1 .. @w) { $cur[$j] = $q[$i-1] eq $w[$j-1] ? $prev[$j-1] + 1 : max($prev[$j], $cur[$j-1]) }
+        @prev = @cur;
+      }
+      my $sim = $prev[-1] / max(scalar @q, scalar @w);
+      if ($sim < 0.6) { printf "W the two disagree (%.0f%% in common)\n", $sim * 100; exit }
+      printf "Q agree %.0f%%\n", $sim * 100; exit
+    }
+    print "Q short\n"' "$1" "$2"
+}
+
+# transcribe_local FILE -> raw text on stdout; returns non-zero on failure
+transcribe_local() {
+  local url resp
+  url=$(cfg '.stt_local_url // "http://127.0.0.1:29333/transcribe"')
+  resp=$(curl -sS --max-time 180 -X POST --data-binary "@$1" "$url") || { log "transcribe-local: curl failed (service down?)"; return 1; }
+  if ! jq -e '.text' >/dev/null 2>&1 <<<"$resp"; then
+    log "transcribe-local: service error: $(head -c 300 <<<"$resp")"
+    return 1
+  fi
+  jq -r '.text' <<<"$resp"
+}
+
+# transcribe_mistral FILE -> raw text on stdout; returns non-zero on failure
+transcribe_mistral() {
+  local key model lang resp
+  key=$(api_key)
+  model=$(cfg '.stt_model // "voxtral-mini-transcribe-3"')
+  lang=$(cfg '.language // empty')
+  local args=(-sS --max-time 120 -H "Authorization: Bearer $key" -F "model=$model" -F "file=@$1")
+  [[ -n $lang && $lang != null ]] && args+=(-F "language=$lang")
+  resp=$(curl "${args[@]}" "$API/audio/transcriptions") || { log "transcribe-mistral: curl failed"; return 1; }
+  if ! jq -e '.text' >/dev/null 2>&1 <<<"$resp"; then
+    log "transcribe-mistral: API error: $(jq -r '.message // .detail // .error.message // empty' <<<"$resp" 2>/dev/null | head -c 300) $(head -c 200 <<<"$resp")"
+    return 1
+  fi
+  jq -r '.text' <<<"$resp"
+}
+
+# transcribe FILE -> raw text on stdout. Engine from config (.stt_engine):
+# "qwen" runs Qwen3-ASR and Whisper together and keeps Qwen's text unless
+# Whisper shows it went wrong (see pick_transcript); Whisper's version is
+# left in alt_raw for the polish step. The other engines:
+# "local" (default) tries the GPU service, then the CPU STT service, then
+# Mistral; "cpu" skips the GPU; "mistral" goes straight to the Mistral API.
+transcribe() {
+  local engine
+  engine=$(cfg '.stt_engine // "local"')
+  if [[ $engine == mistral ]]; then
+    transcribe_mistral "$1"
+    return
+  fi
+  local out
+  rm -f "$STATE_DIR/alt_raw"
+  # Long takes skip Qwen: on a 35-minute take (10 Nov) it grew to 8 GB of RAM
+  # plus 5 GB of swap and froze the machine. Whisper handles long audio in
+  # chunks. 16 kHz mono s16 = 32000 bytes per second (config .qwen_max_seconds).
+  if [[ $engine == qwen ]]; then
+    local qmax secs
+    qmax=$(cfg '.qwen_max_seconds // 120')
+    secs=$(( $(stat -c %s "$1" 2>/dev/null || echo 0) / 32000 ))
+    if (( secs > qmax )); then
+      log "take is ${secs}s (over ${qmax}s): Whisper only"
+      engine=local
+    fi
+  fi
+  if [[ $engine == qwen ]]; then
+    # Both models hear the take at the same time; Whisper referees.
+    local qf wf qrc wrc q w verdict
+    qf=$(mktemp "$STATE_DIR/q.XXXXXX"); wf=$(mktemp "$STATE_DIR/w.XXXXXX")
+    transcribe_qwen "$1" >"$qf" & local qpid=$!
+    transcribe_gpu "$1" >"$wf"; wrc=$?
+    wait "$qpid"; qrc=$?
+    q=$(tr '\r\n' '  ' <"$qf" | tr -s ' ' | sed 's/^ //; s/ $//'); w=$(tr '\r\n' '  ' <"$wf" | tr -s ' ' | sed 's/^ //; s/ $//')
+    rm -f "$qf" "$wf"
+    if (( wrc == 0 )) && [[ -z $w ]]; then
+      # Whisper and the speech detector found no speech: trust that over
+      # anything Qwen produced.
+      [[ -n $q ]] && log "no speech; qwen's text discarded: $(head -c 80 <<<"$q")"
+      return 0
+    fi
+    if (( qrc == 0 )); then
+      local wref=""; (( wrc == 0 )) && wref=$w
+      verdict=$(pick_transcript "$q" "$wref")
+      log "engine pick: $verdict"
+      if [[ $verdict == Q* ]]; then
+        (( wrc == 0 )) && printf '%s' "$w" >"$STATE_DIR/alt_raw"
+        printf '%s' "$q"; return 0
+      fi
+    else
+      log "transcribe: qwen failed, using whisper"
+    fi
+    if (( wrc == 0 )); then printf '%s' "$w"; return 0; fi
+  fi
+  if [[ $engine != cpu && $engine != qwen ]]; then
+    if out=$(transcribe_gpu "$1"); then
+      printf '%s' "$out"
+      return 0
+    fi
+    log "transcribe: GPU engine failed, trying CPU service"
+  fi
+  if out=$(transcribe_local "$1"); then
+    printf '%s' "$out"
+    return 0
+  fi
+  log "transcribe: local engines failed, falling back to Mistral"
+  transcribe_mistral "$1"
+}
+
+# polish RAW -> polished text on stdout (falls back to RAW on any failure)
+polish() {
+  local raw=$1 alt=${2:-} key model style style_line system payload resp out
+  [[ $(cfg '(.polish | if . == null then true else . end)') == true ]] || { printf '%s' "$raw"; return; }
+  key=$(api_key)
+  model=$(cfg '.polish_model // "mistral-small-latest"')
+  style=$(cfg '.style // "natural"')
+  style_line=$(jq -r --arg s "$style" '.styles[$s] // empty' "$CONFIG" 2>/dev/null)
+  system=$(cat "$CONF_DIR/polish-system.txt" 2>/dev/null)
+  [[ -s $CONF_DIR/vocabulary.txt ]] && system+=$'\n\n## Vocabulary list\n'"$(cat "$CONF_DIR/vocabulary.txt")"
+  payload=$(jq -n --arg m "$model" --arg sys "$system" --arg style "Style: $style. $style_line" --arg raw "$raw" \
+    --arg alt "$alt" '{model:$m, temperature:0, messages:[{role:"system",content:$sys},{role:"user",content:($style+"\n\n<transcript>\n"+$raw+"\n</transcript>"+(if $alt != "" then "\n\n<second_hearing>\n"+$alt+"\n</second_hearing>" else "" end))}]}')
+  resp=$(curl -sS --max-time 45 -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+    -d "$payload" "$API/chat/completions") || { log "polish: curl failed, using raw"; printf '%s' "$raw"; return; }
+  out=$(jq -r '.choices[0].message.content // empty' <<<"$resp" 2>/dev/null)
+  out=$(sed -e 's#</\?transcript>##g' -e 's#</\?second_hearing>##g' <<<"$out")
+  if [[ -z ${out//[[:space:]]/} ]]; then
+    log "polish: no content, using raw: $(head -c 200 <<<"$resp")"
+    printf '%s' "$raw"
+    return
+  fi
+  # Sanity guard: cleanup may trim fillers but must never answer the
+  # dictation, summarize it, or pad it. Way shorter or longer => keep raw.
+  local rw ow
+  rw=$(wc -w <<<"$raw"); ow=$(wc -w <<<"$out")
+  if (( rw >= 8 && (ow * 100 < rw * 60 || ow * 100 > rw * 125 + 500) )); then
+    log "polish: rejected (raw $rw words -> $ow words), using raw"
+    printf '%s' "$raw"
+  else
+    printf '%s' "$out"
+  fi
+}
+
+# fix_text TEXT -> text with deterministic fixes, no network:
+#   1. replacements.txt ("heard => correct" per line): whole words, any
+#      case, longest phrase first. For names the model keeps mishearing.
+#   2. filler words (um, uh, erm) removed (config .fillers, default true).
+fix_text() {
+  printf '%s' "$1" | FILLERS=$(cfg '(.fillers | if . == null then true else . end)') perl -CSD -Mutf8 -e '
+    my %m;
+    if (open my $f, "<:utf8", $ARGV[0]) {
+      while (<$f>) {
+        next if /^\s*(#|$)/; chomp;
+        my ($a, $b) = split /\s*=>\s*/, $_, 2;
+        next unless defined $b;
+        s/^\s+|\s+$//g for $a, $b;
+        $m{lc $a} = $b if length($a) >= 2;
+      }
+    }
+    local $/; my $t = <STDIN>; $t = "" unless defined $t;
+    if (%m) {
+      my $alt = join "|", map { quotemeta } sort { length($b) <=> length($a) } keys %m;
+      $t =~ s/(?<!\w)($alt)(?!\w)/$m{lc $1}/gi;
+    }
+    $t =~ s/,(?=[A-Za-z])/, /g;   # the model sometimes glues words to a comma
+    if ($ENV{FILLERS} eq "true") {
+      $t =~ s/(^|[.!?]\s+)?(?<![\w\x27’-])(?:[Uu]m+|[Uu]h+|[Ee]rm+)(?![\w\x27’-])\s*(?:,|…|\.\.\.)?\s*(\w)?/
+        my ($p, $n) = ($1, $2);
+        defined $p ? $p . (defined $n ? uc $n : "") : (defined $n ? $n : "")/ge;
+      $t =~ s/,\s*([.!?])/$1/g;
+      $t =~ s/ +([,.!?;:])/$1/g;
+      $t =~ s/  +/ /g; $t =~ s/^\s+|\s+$//g;
+    }
+    print $t' "$CONF_DIR/replacements.txt"
+}
+
+# spoken_breaks TEXT -> "new paragraph" / "new line" said as a command become
+# a paragraph break (config .spoken_breaks, default true). Only at the start
+# or right after punctuation, so "draw a new line" is left alone.
+spoken_breaks() {
+  [[ $(cfg '(.spoken_breaks | if . == null then true else . end)') == true ]] || { printf '%s' "$1"; return; }
+  printf '%s' "$1" | perl -CSD -Mutf8 -e '
+    local $/; my $t = <STDIN>; $t = "" unless defined $t;
+    $t =~ s/(^|[.!?,;:])\s*new (?:paragraph|line)\b[\s,.;:!]*(\w)?/
+      my ($p, $n) = ($1, $2);
+      ($p =~ m{[.!?]} ? $p : ($p eq "" ? "" : ".")) . ($p eq "" ? "" : "\n\n") . (defined $n ? uc $n : "")/gie;
+    $t =~ s/\s+$//;
+    print $t'
+}
+
+# shape_text TEXT -> text ready to deliver. config .newlines:
+#   "paragraphs" (default) — one message; blank-line paragraph breaks kept
+#   "space"                — everything flattened into a single paragraph
+# Single line breaks (Whisper emits one per segment) always become spaces.
+shape_text() {
+  local mode
+  mode=$(cfg '.newlines // "paragraphs"')
+  if [[ $mode == space ]]; then
+    printf '%s' "$1" | tr '\r\n' '  ' | tr -s ' ' | sed 's/^ //; s/ $//'
+  else
+    printf '%s' "$1" | tr -d '\r' | awk 'BEGIN{RS=""} {gsub(/[ \t]*\n[ \t]*/," "); gsub(/  +/," "); sub(/^ /,""); sub(/ $/,""); printf "%s%s", (NR>1?"\n\n":""), $0}'
+  fi
+}
+
+# hypr_key MODS KEY — press+release through Hyprland itself (same route as
+# Omarchy's Super+V universal paste), so real keycodes reach the app.
+hypr_key() {
+  hyprctl dispatch "hl.dsp.send_key_state({ mods = \"$1\", key = \"$2\", state = \"down\" })" >/dev/null 2>&1 || return 1
+  sleep 0.05
+  hyprctl dispatch "hl.dsp.send_key_state({ mods = \"$1\", key = \"$2\", state = \"up\" })" >/dev/null 2>&1
+}
+
+active_is_terminal() {
+  hyprctl activewindow -j 2>/dev/null | jq -e '
+    ([.tags[]? | sub("\\*$";"")] | index("terminal")) != null
+    or ((.class // "") | test("^(kitty|foot|footclient|Alacritty|com\\.mitchellh\\.ghostty|org\\.wezfurlong\\.wezterm)$";"i"))' >/dev/null 2>&1
+}
+
+# paste_text TEXT — clipboard + paste shortcut. Instant for any length, no
+# Enter keypresses, no dropped characters. The previous clipboard content
+# is put back afterwards (config .restore_clipboard, default true).
+paste_text() {
+  command -v wl-copy >/dev/null && command -v hyprctl >/dev/null || return 1
+  local save="$STATE_DIR/clip.save" mimef="$STATE_DIR/clip.mime" genf="$STATE_DIR/clip.gen" mime="" restore gen
+  restore=$(cfg '(.restore_clipboard | if . == null then true else . end)')
+  gen=$(date +%s%N); printf '%s' "$gen" >"$genf"
+  if [[ $restore == true && -s $save && -s $mimef ]]; then
+    # An earlier dictation has not put the clipboard back yet: what is saved
+    # is still the real original, so keep it rather than saving a transcript.
+    mime=$(cat "$mimef")
+  elif [[ $restore == true ]]; then
+    rm -f "$save" "$mimef"
+    local types
+    types=$(timeout 1 wl-paste -l 2>/dev/null)
+    if grep -qx 'text/plain;charset=utf-8' <<<"$types"; then mime='text/plain;charset=utf-8'
+    elif grep -q '^text/plain' <<<"$types"; then mime='text/plain'
+    else mime=$(grep -m1 '^image/' <<<"$types"); fi
+    [[ -n $mime ]] && { timeout 2 wl-paste -n -t "$mime" >"$save" 2>/dev/null && printf '%s' "$mime" >"$mimef" || rm -f "$save" "$mimef"; }
+  else
+    rm -f "$save" "$mimef"
+  fi
+  printf '%s' "$1" | wl-copy || return 1
+  sleep 0.12
+  if active_is_terminal; then hypr_key "CTRL SHIFT" V; else hypr_key "CTRL" V; fi || return 1
+  if [[ -s $save ]]; then
+    # Put the old clipboard back only if nothing else has happened to it:
+    # no newer dictation, and it still holds this transcript (so anything
+    # you copied yourself in the meantime is never overwritten).
+    ( sleep 1
+      [[ $(cat "$genf" 2>/dev/null) == "$gen" ]] || exit 0
+      if [[ "$(timeout 1 wl-paste -n 2>/dev/null)" == "$1" ]]; then wl-copy -t "$mime" <"$save"; fi
+      rm -f "$save" "$mimef" ) >/dev/null 2>&1 &
+    disown
+  fi
+  return 0
+}
+
+# type_text TEXT — keystroke fallback (config .delivery = "type"). Line
+# breaks go out as Shift+Enter so they never send a message. Note: wtype
+# can drop characters in Chromium/Electron apps; paste is the default.
+type_text() {
+  local first=1 line
+  while IFS= read -r line; do
+    (( first )) || wtype -M shift -k Return -m shift || return 1
+    first=0
+    [[ -z $line ]] || wtype -- "$line" || return 1
+  done <<<"$1"
+}
+
+# deliver TEXT — one dictation = one message, never an Enter keypress.
+deliver() {
+  local text
+  text=$(shape_text "$1")
+  if [[ $(cfg '.delivery // "paste"') == type ]]; then
+    command -v wtype >/dev/null && type_text "$text" && return 0
+  else
+    paste_text "$text" && return 0
+    log "paste failed, trying keystrokes"
+    command -v wtype >/dev/null && type_text "$text" && return 0
+  fi
+  return 1
+}
+
+now_ms() { date +%s%3N; }
+
+process() {
+  local wav=$1 raw text t0 t1 t2
+  set_status processing
+  t0=$(now_ms)
+  raw=$(transcribe "$wav") || {
+    cp -f "$wav" "$STATE_DIR/last.wav" 2>/dev/null
+    set_status error
+    notify "Cornerstone failed" "Audio kept — run: cornerstone retry"
+    return 1
+  }
+  t1=$(now_ms)
+  cp -f "$wav" "$STATE_DIR/last.wav" 2>/dev/null
+  # Keep the 10 most recent takes so engines/models can be compared on real speech.
+  [[ ${2:-type} == type ]] && mkdir -p "$STATE_DIR/takes" && cp -f "$wav" "$STATE_DIR/takes/$(date +%Y%m%d-%H%M%S).wav" 2>/dev/null
+  ls -1t "$STATE_DIR/takes"/*.wav 2>/dev/null | tail -n +11 | xargs -r rm -f
+  # Whisper breaks lines per segment, not per paragraph: flatten them.
+  raw=$(printf '%s' "$raw" | tr '\r\n' '  ' | tr -s ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  if [[ -z $raw ]]; then log "empty transcript"; set_status idle; return 0; fi
+  raw=$(fix_text "$raw")
+  if [[ -z $raw ]]; then log "empty transcript"; set_status idle; return 0; fi
+  printf '%s\n' "$raw" >"$STATE_DIR/last_raw"
+  # A second model's version of the same audio, when there is one and it
+  # differs: polish uses it to settle words the main model may have misheard.
+  local alt=""
+  if [[ -s $STATE_DIR/alt_raw ]]; then
+    alt=$(fix_text "$(cat "$STATE_DIR/alt_raw")")
+    [[ ${alt,,} == "${raw,,}" ]] && alt=""
+  fi
+  text=$(polish "$raw" "$alt")
+  t2=$(now_ms)
+  text=$(spoken_breaks "$(fix_text "$text")")
+  # Straight quotes always: curly ones break shells, code and search.
+  text=$(shape_text "$text" | sed -e "s/[‘’]/'/g" -e 's/[“”]/"/g')
+  printf '%s\n' "$text" >"$STATE_DIR/last_text"
+  log "ok: $(wc -w <<<"$text") words (stt $((t1 - t0)) ms, polish $((t2 - t1)) ms)"
+  if [[ ${2:-type} == type ]]; then
+    # Serialize output so overlapping runs never interleave.
+    exec 9>"$STATE_DIR/type.lock"
+    flock -w 120 9
+    if ! deliver "$text"; then
+      log "delivery failed, left on clipboard"
+      command -v wl-copy >/dev/null && printf '%s' "$text" | wl-copy
+      notify "Cornerstone" "Couldn't type it — copied to clipboard"
+    fi
+    flock -u 9
+  else
+    printf '%s\n' "$text"
+  fi
+  set_status idle
+}
+
+# Media: pause whatever is playing while recording, resume only those
+# players afterwards (config .pause_media, default true).
+MPRIS=(/org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player)
+pause_media() {
+  [[ $(cfg '(.pause_media | if . == null then true else . end)') == true ]] || return 0
+  local n
+  : >"$STATE_DIR/paused"
+  for n in $(busctl --user list --no-legend 2>/dev/null | awk '$1 ~ /^org\.mpris\.MediaPlayer2\./ {print $1}'); do
+    [[ $(timeout 1 busctl --user get-property "$n" "${MPRIS[@]}" PlaybackStatus 2>/dev/null) == *Playing* ]] || continue
+    timeout 1 busctl --user call "$n" "${MPRIS[@]}" Pause >/dev/null 2>&1 && printf '%s\n' "$n" >>"$STATE_DIR/paused"
+  done
+}
+resume_media() {
+  local n
+  [[ -s $STATE_DIR/paused ]] || return 0
+  while read -r n; do timeout 1 busctl --user call "$n" "${MPRIS[@]}" Play >/dev/null 2>&1; done <"$STATE_DIR/paused"
+  rm -f "$STATE_DIR/paused"
+}
+
+# wav_levels FILE -> "<loudest 30 ms window, dBFS> <1 if every sample is exactly zero>"
+wav_levels() {
+  perl -e '
+    local $/; open my $f, "<:raw", $ARGV[0] or exit 1; my $d = <$f> // "";
+    my $at = index($d, "data"); $d = substr($d, $at < 0 ? 44 : $at + 8);
+    my @s = unpack("s<*", $d); my ($best, $nz) = (0, 0);
+    for (my $i = 0; $i + 480 <= @s; $i += 480) {
+      my ($sum, $sq) = (0, 0);
+      for my $j ($i .. $i + 479) { $sum += $s[$j]; $nz ||= $s[$j] != 0 }
+      my $mean = $sum / 480;
+      for my $j ($i .. $i + 479) { my $d = $s[$j] - $mean; $sq += $d * $d }
+      my $r = sqrt($sq / 480) / 32768; $best = $r if $r > $best;
+    }
+    printf "%d %d\n", ($best > 0 ? 20 * log($best) / log(10) : -120), ($nz ? 0 : 1)' "$1"
+}
+
+start() {
+  # The API key is only required when the Mistral engine is selected; the
+  # local engine records with no key (polish falls back to raw without one).
+  if [[ $(cfg '.stt_engine // "local"') == mistral && -z $(api_key) ]]; then set_status nokey; log "no API key"; notify "Cornerstone" "No API key set"; return 1; fi
+  is_recording && return 0
+  rm -f "$WAV"
+  # Pin the capture device when configured (config .mic_target = PipeWire
+  # node name); empty means the system default source.
+  # The mic is chosen in the audio panel ("Microphone by app" -> Cornerstone
+  # dictation), which keeps it in audio-mic-pins.json. No choice there means
+  # the system default input.
+  local target
+  target=$(jq -r '.Cornerstone // empty' "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/audio-mic-pins.json" 2>/dev/null)
+  if [[ -n $target ]] && ! pactl list short sources 2>/dev/null | cut -f2 | grep -qxF "$target"; then
+    log "chosen mic not present ($target), using default input"; target=""
+  fi
+  if [[ -n $target && $target != null ]]; then
+    setsid pw-record -P application.name=Cornerstone -P node.name=cornerstone-dictation --target "$target" --rate 16000 --channels 1 --format s16 "$WAV" >/dev/null 2>&1 &
+  else
+    setsid pw-record -P application.name=Cornerstone -P node.name=cornerstone-dictation --rate 16000 --channels 1 --format s16 "$WAV" >/dev/null 2>&1 &
+  fi
+  local rec=$!
+  echo "$rec" >"$PID_FILE"
+  set_status recording
+  ( play_cue start; pause_media ) >/dev/null 2>&1 &
+  disown
+  # Runaway guard: a take left running (stuck key, double press) is stopped
+  # and transcribed after .max_record_seconds (default 10 minutes).
+  local max
+  max=$(cfg '.max_record_seconds // 600')
+  ( sleep "$max"
+    [[ $(cat "$PID_FILE" 2>/dev/null) == "$rec" ]] && kill -0 "$rec" 2>/dev/null || exit 0
+    log "recording hit the ${max}s limit, stopped automatically"
+    notify "Cornerstone stopped listening" "Dictation ran for $((max / 60)) minutes, so it was stopped automatically."
+    "$0" stop ) >/dev/null 2>&1 &
+  disown
+}
+
+# panic — emergency stop. Kills the recorder and every transcription job,
+# throws the audio away, and restarts the speech servers so whatever they
+# were chewing on stops and its memory is freed.
+panic() {
+  local me=$$ p ancestors=" " x
+  x=$me; while [[ -n $x && $x != 1 && $x != 0 ]]; do ancestors+="$x "; x=$(awk '/^PPid:/{print $2}' /proc/"$x"/status 2>/dev/null); done
+  pkill -KILL -f '^pw-record .*node\.name=cornerstone-dictation' 2>/dev/null
+  for p in $(pgrep -f '\.local/bin/(omarchy-dictation-cornerstone|cornerstone)( |$)'); do
+    [[ $ancestors == *" $p "* ]] && continue
+    pkill -KILL -P "$p" 2>/dev/null
+    kill -KILL "$p" 2>/dev/null
+  done
+  rm -f "$PID_FILE" "$WAV" "$STATE_DIR"/job-*.wav "$STATE_DIR"/retry-*.wav "$STATE_DIR"/q.* "$STATE_DIR"/w.*
+  resume_media
+  set_status idle
+  systemctl --user restart --no-block cornerstone-stt-qwen.service cornerstone-stt-gpu.service cornerstone-stt.service 2>/dev/null
+  log "EMERGENCY STOP: recorder and jobs killed, speech servers restarted"
+  notify "Cornerstone stopped" "Emergency stop: dictation killed and memory freed."
+}
+
+stop() {
+  if ! is_recording; then rm -f "$PID_FILE"; return 0; fi
+  local pid
+  pid=$(cat "$PID_FILE")
+  sleep 0.2   # let the tail of the last word reach the recorder
+  kill -INT "$pid" 2>/dev/null
+  for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  rm -f "$PID_FILE"
+  resume_media
+  ( play_cue stop ) >/dev/null 2>&1 &
+  # Under ~0.3 s of audio (44-byte header + 16 kHz * 2 bytes) is an accidental tap.
+  if [[ ! -s $WAV ]] || (( $(stat -c %s "$WAV") < 9600 )); then
+    log "recording too short, ignored"; set_status idle; return 0
+  fi
+  # Whisper invents text for silence ("Thank you."), so silence is never
+  # transcribed. All-zero samples mean the mic delivered nothing at all
+  # (muted in hardware, or another app took the device); otherwise the
+  # loudest 30 ms of the take has to rise above -50 dBFS.
+  local lvl zero
+  read -r lvl zero < <(wav_levels "$WAV")
+  if [[ ${zero:-0} == 1 ]] || (( ${lvl:-0} < -50 )); then
+    log "silent recording (loudest ${lvl} dBFS, all-zero=${zero}), nothing typed"
+    rm -f "$WAV"; set_status idle
+    if [[ $zero == 1 ]]; then notify "Cornerstone got no audio" "The microphone sent nothing. Is it muted, or held by another app? Try again."
+    else notify "Cornerstone heard nothing" "No speech in that recording."; fi
+    return 0
+  fi
+  # Give this take its own file so a new dictation can't overwrite or delete
+  # it while it's still transcribing.
+  local job="$STATE_DIR/job-$(date +%s%N).wav"
+  mv -f "$WAV" "$job"
+  # Return to the keybind at once; transcription finishes in the background.
+  ( process "$job" type; rm -f "$job" ) >/dev/null 2>&1 &
+  disown
+}
+
+set_cfg() { local tmp; tmp=$(mktemp "$CONFIG.XXXXXX") && jq "$@" "$CONFIG" >"$tmp" && mv -f "$tmp" "$CONFIG"; }
+
+case "${1:-}" in
+  start) start ;;
+  stop) stop ;;
+  toggle) if is_recording; then stop; else start; fi ;;
+  panic|kill|emergency-stop) panic ;;
+  cancel)
+    # Throw the current recording away: nothing is transcribed or typed.
+    if is_recording; then
+      kill -INT "$(cat "$PID_FILE")" 2>/dev/null; rm -f "$PID_FILE" "$WAV"
+      resume_media; set_status idle; log "recording cancelled"
+    fi ;;
+  media-pause|fillers|spoken-breaks)
+    [[ ${2:-} =~ ^(on|off)$ ]] || { echo "$1: on|off" >&2; exit 1; }
+    k=${1//-/_}; [[ $k == media_pause ]] && k=pause_media
+    set_cfg --arg k "$k" --argjson v "$([[ $2 == on ]] && echo true || echo false)" '.[$k] = $v' ;;
+  polish-on) set_cfg '.polish = true' ;;
+  polish-off) set_cfg '.polish = false' ;;
+  sounds-on) set_cfg '.sounds = true' ;;
+  sounds-off) set_cfg '.sounds = false' ;;
+  engine)
+    [[ ${2:-} =~ ^(qwen|local|cpu|mistral)$ ]] || { echo "engine: qwen|local|cpu|mistral" >&2; exit 1; }
+    set_cfg --arg s "$2" '.stt_engine = $s' ;;
+  style)
+    [[ ${2:-} =~ ^(natural|chat|email|code)$ ]] || { echo "style: natural|chat|email|code" >&2; exit 1; }
+    set_cfg --arg s "$2" '.style = $s' ;;
+  newlines)
+    [[ ${2:-} =~ ^(paragraphs|space)$ ]] || { echo "newlines: paragraphs|space" >&2; exit 1; }
+    set_cfg --arg s "$2" '.newlines = $s' ;;
+  delivery)
+    [[ ${2:-} =~ ^(paste|type)$ ]] || { echo "delivery: paste|type" >&2; exit 1; }
+    set_cfg --arg s "$2" '.delivery = $s' ;;
+  retry)
+    # Re-run the last recording (kept after every take, including failures).
+    [[ -s $STATE_DIR/last.wav ]] || { echo "no saved audio" >&2; exit 1; }
+    cp -f "$STATE_DIR/last.wav" "$STATE_DIR/retry-$$.wav"
+    if [[ ${2:-} == print ]]; then process "$STATE_DIR/retry-$$.wav" print; rm -f "$STATE_DIR/retry-$$.wav"
+    else ( process "$STATE_DIR/retry-$$.wav" type; rm -f "$STATE_DIR/retry-$$.wav" ) >/dev/null 2>&1 & disown; fi ;;
+  gpu) cornerstone-gpu-watch report ;;
+  copy-last) wl-copy <"$STATE_DIR/last_text" ;;
+  config) cat "$CONFIG" ;;
+  transcribe-file)
+    [[ -f ${2:-} ]] || { echo "usage: $0 transcribe-file FILE.wav" >&2; exit 1; }
+    process "$2" print ;;
+  *) echo "Usage: $0 start|stop|toggle|cancel|gpu|media-pause <on|off>|fillers <on|off>|spoken-breaks <on|off>|retry [print]|copy-last|polish-on|polish-off|style <name>|engine <qwen|local|cpu|mistral>|delivery <paste|type>|newlines <paragraphs|space>|config|transcribe-file <wav>" >&2; exit 1 ;;
+esac
