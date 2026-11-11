@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly YouTube playback check (Cornerstone)
+
+[Timer]
+OnCalendar=Mon *-*-* 12:00:00
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

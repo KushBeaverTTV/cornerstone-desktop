@@ -1,0 +1,8 @@
+[Unit]
+Description=Check that YouTube music still plays through the Cornerstone music engine
+After=lavalink.service yt-cipher.service
+Requires=cornerstone-storage.service
+
+[Service]
+Type=oneshot
+ExecStart=/mnt/storage/files/cornerstone-hq/scripts/youtube-check
