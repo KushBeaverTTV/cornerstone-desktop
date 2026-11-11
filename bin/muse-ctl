@@ -9,7 +9,9 @@ UF="${XDG_STATE_HOME:-$HOME/.local/state}/muse-widget/usage.json"
 case "${1:-}" in
   open) exec app-summon "$P" webapp-chrome https://muse.ai/ ;;
   usage)
-    if [[ $(app-summon --count "$P") -gt 0 ]]; then app-summon "$P"; fi
+    # Reuse the settings window if it is already open; otherwise open it.
+    U='^chrome-muse\.ai__subscriptions-.*$'
+    if [[ $(app-summon --count "$U") -gt 0 ]]; then exec app-summon "$U"; fi
     exec webapp-chrome https://muse.ai/subscriptions ;;
   hide) exec app-summon --hide "$P" ;;
   close) exec app-summon --close "$P" ;;
