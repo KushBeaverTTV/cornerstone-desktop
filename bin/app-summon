@@ -18,6 +18,17 @@ windows() {  # addresses matching the class regex, most recently used first
 }
 dispatch() { hyprctl dispatch "$1" >/dev/null 2>&1; }
 
+# focus ADDRESS — on Omarchy's floating workspaces focusing by address is
+# silently ignored (seen 2026-11-11, Hyprland 0.56), so check that focus really
+# moved and fall back to the window's exact class (one window per app here).
+focus() {
+  local a=$1 cls
+  dispatch "hl.dsp.focus({ window = \"address:$a\" })"
+  [[ $(hyprctl activewindow -j | jq -r '.address') == "$a" ]] && return 0
+  cls=$(hyprctl clients -j | jq -r --arg a "$a" '.[] | select(.address == $a) | .class')
+  [[ -n $cls ]] && dispatch "hl.dsp.focus({ window = \"class:^$(sed 's/[.[\*^$()+?{|]/\\&/g' <<<"$cls")\$\" })"
+}
+
 case "${1:-}" in
   --close)
     for a in $(windows "$2"); do dispatch "hl.dsp.window.close({ window = \"address:$a\" })"; done ;;
@@ -40,5 +51,5 @@ case "${1:-}" in
     ws=$(hyprctl activeworkspace -j | jq -r '.id')
     cur=$(hyprctl clients -j | jq -r --arg a "$keep" '.[] | select(.address == $a) | .workspace.id')
     [[ $cur != "$ws" ]] && dispatch "hl.dsp.window.move({ workspace = \"$ws\", follow = false, window = \"address:$keep\" })"
-    dispatch "hl.dsp.focus({ window = \"address:$keep\" })" || hyprctl dispatch focuswindow "address:$keep" >/dev/null ;;
+    focus "$keep" ;;
 esac
