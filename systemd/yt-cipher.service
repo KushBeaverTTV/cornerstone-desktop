@@ -1,0 +1,29 @@
+[Unit]
+Description=yt-cipher YouTube stream decoder for Lavalink (Cornerstone music engine)
+After=network-online.target
+Before=lavalink.service
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/storage/files/bots/yt-cipher
+ExecStart=/usr/bin/deno run --cached-only --allow-net --allow-read --allow-write --allow-env server.ts
+Restart=on-failure
+RestartSec=5
+MemoryMax=768M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/mnt/storage/files/bots/yt-cipher
+Environment=HOME=/mnt/storage/files/bots/yt-cipher
+Environment=XDG_CACHE_HOME=/mnt/storage/files/bots/yt-cipher/player_cache
+Environment=DENO_DIR=/mnt/storage/files/bots/yt-cipher/.deno-cache
+Environment=DENO_NO_UPDATE_CHECK=1
+# Loopback only: Lavalink is the only client.
+Environment=HOST=127.0.0.1
+Environment=PORT=8001
+# Same as the Windows host: the IAS player variant is the one that decodes.
+Environment=OVERRIDE_PLAYER_VARIANT=IAS
+Environment=MAX_THREADS=4
+
+[Install]
+WantedBy=default.target

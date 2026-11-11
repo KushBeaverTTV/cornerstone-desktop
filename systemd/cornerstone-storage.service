@@ -1,0 +1,13 @@
+[Unit]
+Description=Wait for the encrypted /mnt/storage drive (Cornerstone services start after it)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The drive unlocks and mounts after the user session starts; without this
+# every Cornerstone service failed once at login and recovered on retry.
+ExecStart=/usr/bin/bash -c 'for i in $(seq 300); do mountpoint -q /mnt/storage && [ -d /mnt/storage/files ] && exit 0; sleep 1; done; echo "/mnt/storage not mounted after 5 minutes" >&2; exit 1'
+TimeoutStartSec=310
+
+[Install]
+WantedBy=default.target

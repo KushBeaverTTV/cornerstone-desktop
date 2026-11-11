@@ -11,6 +11,6 @@ cat > ~/.config/google-chrome/NativeMessagingHosts/com.kushbeaverttv.muse_usage.
  "path":"$HOME/.local/share/muse-agent/usage-host.py","type":"stdio",
  "allowed_origins":["chrome-extension://$(cat "$here/muse-agent/ext-id.txt")/"]}
 JSON
-for u in "$here"/systemd/*; do cp -n "$u" ~/.config/systemd/user/; done
+for u in "$here"/systemd/*; do cp -rn "$u" ~/.config/systemd/user/; done
 systemctl --user daemon-reload
 echo "Installed. Plugins live in their own repos (cornerstone-*)."
