@@ -16,4 +16,5 @@ Productionz. Run `./install.sh` to link them into place.
 
 The plugins themselves: cornerstone-stats, cornerstone-island,
 cornerstone-phones, cornerstone-audio, cornerstone-discord, cornerstone-muse,
-cornerstone-dictation, cornerstone-hq-widget.
+cornerstone-dictation, cornerstone-hq-widget, cornerstone-gpu,
+cornerstone-capture, cornerstone-rig, cornerstone-worktrees, cornerstone-parked.
