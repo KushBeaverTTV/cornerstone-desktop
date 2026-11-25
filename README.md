@@ -6,6 +6,7 @@ Productionz. Run `./install.sh` to link them into place.
 | Path | What it is |
 |---|---|
 | `bin/omarchy-dictation-cornerstone` (`cornerstone`) | Cornerstone dictation: local Qwen3-ASR with Whisper as referee, Mistral polish, paste. `cornerstone panic` is the emergency stop; recordings stop by themselves after 10 minutes |
+| `bin/cornerstone-jarvis` + `jarvis/jarvisd.py` | Cornerstone Jarvis: hands-free `"Hey Jarvis"` wake word (`openWakeWord`), local GPU STT, streaming `agy` agent bridge, and Piper British TTS voice replies integrated into the Dynamic Island |
 | `bin/cornerstone-gpu-watch` | Warns when dictation uses too much GPU or runs slow |
 | `bin/app-summon` | One window per app: brings it to your workspace, closes extra copies, or launches it |
 | `bin/discord-ctl`, `bin/muse-ctl`, `bin/cornerstone-hq-open` | Window and action helpers for the Discord, Muse and HQ widgets |

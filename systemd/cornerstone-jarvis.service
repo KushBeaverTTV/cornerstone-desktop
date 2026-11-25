@@ -1,0 +1,15 @@
+[Unit]
+Description=Cornerstone Jarvis (Hey Jarvis wake word, local STT, agy voice agent, Piper TTS)
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/cornerstone-jarvis/venv/bin/python -u %h/.local/share/cornerstone-jarvis/jarvisd.py
+Restart=on-failure
+RestartSec=3
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/share/mise/installs/antigravity-cli/latest:%h/.local/bin:/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin
+Environment=ORT_LOGGING_LEVEL=3
+
+[Install]
+WantedBy=default.target

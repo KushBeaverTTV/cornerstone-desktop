@@ -8,6 +8,8 @@ mkdir -p ~/.local/bin ~/.local/share ~/.config/systemd/user \
 for f in "$here"/bin/*; do ln -sfn "$f" ~/.local/bin/"$(basename "$f")"; done
 ln -sfn ~/.local/bin/omarchy-dictation-cornerstone ~/.local/bin/cornerstone
 [ -e ~/.local/share/muse-agent ] || ln -s "$here/muse-agent" ~/.local/share/muse-agent
+mkdir -p ~/.local/share/cornerstone-jarvis
+ln -sfn "$here/jarvis/jarvisd.py" ~/.local/share/cornerstone-jarvis/jarvisd.py
 ext_id="$(cat "$here/muse-agent/ext-id.txt")"
 for host_dir in ~/.config/google-chrome/NativeMessagingHosts ~/.config/chromium/NativeMessagingHosts; do
   cat > "$host_dir/com.kushbeaverttv.muse_usage.json" <<JSON
