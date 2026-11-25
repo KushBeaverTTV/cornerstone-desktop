@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Chrome native-messaging host: saves the Muse quota numbers the add-on read,
 for the Omarchy bar widget. Validates everything; writes one small JSON file."""
-import json, os, struct, sys, time
+import json, os, shutil, struct, subprocess, sys, time
 
 OUT = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "muse-widget", "usage.json")
 
@@ -23,15 +23,26 @@ def clean(d):
     out = {}
     if isinstance(d.get("weeklyPct"), (int, float)) and 0 <= d["weeklyPct"] <= 100:
         out["weeklyPct"] = round(float(d["weeklyPct"]), 1)
+    if isinstance(d.get("sessionPct"), (int, float)) and 0 <= d["sessionPct"] <= 100:
+        out["sessionPct"] = round(float(d["sessionPct"]), 1)
     if isinstance(d.get("extraTokens"), (int, float)) and 0 <= d["extraTokens"] < 1e15:
         out["extraTokens"] = float(d["extraTokens"])
-    for k, lim in (("resetText", 48), ("extraText", 40), ("plan", 10)):
+    for k, lim in (("resetText", 48), ("sessionResetText", 48), ("extraText", 40), ("plan", 24)):
         v = d.get(k)
         if isinstance(v, str):
             v = "".join(c for c in v if c.isprintable())[:lim].strip()
             if v:
                 out[k] = v
     return out
+
+def notify_shell():
+    exe = shutil.which("omarchy-shell")
+    if not exe:
+        return
+    try:
+        subprocess.Popen([exe, "muse", "refresh"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 def main():
     msg = read_msg()
@@ -54,6 +65,8 @@ def main():
     with open(tmp, "w") as f:
         json.dump(merged, f)
     os.replace(tmp, OUT)
+    notify_shell()
     reply({"ok": True})
 
-main()
+if __name__ == "__main__":
+    main()
