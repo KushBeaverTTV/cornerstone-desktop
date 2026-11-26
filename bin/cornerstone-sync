@@ -195,10 +195,12 @@ def configure_shell(profile, dry_run=False):
         print(f"[dry-run] Would write tailored {SHELL_JSON} (barMode={rec['barMode']})")
         return
 
-    bak = f"{SHELL_JSON}.bak.{int(time.time())}"
+    bak_dir = os.path.join(HOME, ".local/share/cornerstone-backups")
+    os.makedirs(bak_dir, exist_ok=True)
+    bak = os.path.join(bak_dir, f"shell.json.bak.{int(time.time())}")
     shutil.copy2(SHELL_JSON, bak)
-    with open(SHELL_JSON, "w") as f:
-        json.dump(cfg, f, indent=2)
+    with open(SHELL_JSON, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
         f.write("\n")
     print(f"Configured {SHELL_JSON} for {profile['model']} ({rec['barMode']} bar; backup: {bak})")
 

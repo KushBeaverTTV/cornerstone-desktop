@@ -79,18 +79,25 @@ def unit_exists(name):
     return False
 
 
-def unit_active(name):
-    fname = name if name.endswith(".service") else f"{name}.service"
-    rc, out = run_cmd(["systemctl", "--user", "is-active", fname], timeout=1.5)
-    return rc == 0 and out == "active"
+def batch_units_active(names):
+    if not names:
+        return {}
+    units = [n if n.endswith(".service") else f"{n}.service" for n in names]
+    rc, out = run_cmd(["systemctl", "--user", "is-active", *units], timeout=1.5)
+    lines = out.splitlines() if out else []
+    return {
+        name: (lines[i].strip() == "active") if i < len(lines) else False
+        for i, name in enumerate(names)
+    }
 
 
-def unit_enabled_or_active(name):
+def unit_enabled_fast(name):
     fname = name if name.endswith(".service") else f"{name}.service"
-    if unit_active(fname):
-        return True
-    rc, out = run_cmd(["systemctl", "--user", "is-enabled", fname], timeout=1.5)
-    return rc == 0 and out in ("enabled", "static", "indirect")
+    user_dir = os.path.join(HOME, ".config/systemd/user")
+    for wants in glob.glob(os.path.join(user_dir, "*.wants")):
+        if os.path.lexists(os.path.join(wants, fname)):
+            return True
+    return False
 
 
 def detect_model():
@@ -364,12 +371,21 @@ def build_profile():
     capture_backend = "gpu-screen-recorder" if gsr_supported else ("wf-recorder" if shutil.which("wf-recorder") else "omarchy")
     clips_unit = unit_exists("cornerstone-clips")
 
+    active_units = batch_units_active(["cornerstone-stt-qwen", "cornerstone-stt-gpu", "cornerstone-jarvis"])
+    stt_ready = (
+        active_units.get("cornerstone-stt-qwen", False)
+        or active_units.get("cornerstone-stt-gpu", False)
+        or unit_enabled_fast("cornerstone-stt-qwen")
+        or unit_enabled_fast("cornerstone-stt-gpu")
+    )
+    jarvis_ready = active_units.get("cornerstone-jarvis", False) or unit_enabled_fast("cornerstone-jarvis")
+
     services = {
         "lanMouse": unit_exists("lan-mouse") or bool(shutil.which("lan-mouse")),
         "sunshine": unit_exists("sunshine") or bool(shutil.which("sunshine")),
         "onedrive": unit_exists("onedrive-mount"),
-        "localStt": gpu["hasDiscreteVram"] and (unit_enabled_or_active("cornerstone-stt-qwen") or unit_enabled_or_active("cornerstone-stt-gpu")),
-        "jarvis": unit_enabled_or_active("cornerstone-jarvis"),
+        "localStt": gpu["hasDiscreteVram"] and stt_ready,
+        "jarvis": jarvis_ready,
         "hq": unit_exists("kbp-server") or unit_exists("hq-bridge"),
         "clips": clips_unit,
         "powerProfiles": bool(shutil.which("powerprofilesctl")),
