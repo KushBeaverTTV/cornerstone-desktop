@@ -2,6 +2,7 @@
 Description=Cornerstone Jarvis (Hey Jarvis wake word, local STT, agy voice agent, Piper TTS)
 After=pipewire.service pipewire-pulse.service wireplumber.service
 Wants=pipewire.service
+ConditionPathExists=%h/.local/share/cornerstone-jarvis/venv/bin/python
 
 [Service]
 Type=simple
