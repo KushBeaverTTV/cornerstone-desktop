@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# cornerstone-capture — multi-device screen recording & replay-buffer controller.
+# Auto-discovers whether this PC supports gpu-screen-recorder + replay buffer
+# (AMD/NVIDIA/Intel desktops) or uses Omarchy's native screenrecorder with
+# wf-recorder fallback (Apple Silicon / other Wayland laptops).
+set -u
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy}"
+REC_PID_FILE="$RUNTIME_DIR/omarchy-screenrecord-pid"
+GSR_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cornerstone-capture"
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cornerstone-capture"
+CFG_FILE="$CFG_DIR/config"
+
+ensure_config() {
+  mkdir -p "$CFG_DIR" "$HOME/Videos"
+  if [[ ! -f $CFG_FILE ]]; then
+    cat >"$CFG_FILE" <<'CFG'
+CLIP_SECONDS=30
+RECORD_AUDIO=desktop
+RECORD_DIR=~/Videos
+CLIP_DIR=~/Videos/Clips
+CFG
+  fi
+}
+
+has_clips_service() {
+  [[ -e "$HOME/.config/systemd/user/cornerstone-clips.service" \
+     || -e "/etc/systemd/user/cornerstone-clips.service" \
+     || -e "/usr/lib/systemd/user/cornerstone-clips.service" ]]
+}
+
+toast() {
+  omarchy-shell dynamic-island toast "$1" "$2" "${3:-󰕧}" "${4:-accent}" >/dev/null 2>&1 || true
+}
+
+is_recording() {
+  if command -v omarchy-capture-screenrecording >/dev/null 2>&1 \
+     && omarchy-capture-screenrecording --status >/dev/null 2>&1; then
+    return 0
+  fi
+  pgrep -x gpu-screen-reco >/dev/null 2>&1 && [[ -f "$GSR_STATE_DIR/recording.pid" ]] && return 0
+  pgrep -x wf-recorder >/dev/null 2>&1 && return 0
+  return 1
+}
+
+elapsed_seconds() {
+  local pf=""
+  if [[ -f $REC_PID_FILE ]]; then
+    pf="$REC_PID_FILE"
+  elif [[ -f "$GSR_STATE_DIR/recording.pid" ]]; then
+    pf="$GSR_STATE_DIR/recording.pid"
+  fi
+  if [[ -n $pf ]]; then
+    local start now
+    start=$(stat -c %Y "$pf" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    if (( start > 0 && now >= start )); then
+      echo $(( now - start ))
+      return
+    fi
+  fi
+  echo 0
+}
+
+overlay_monitor() {
+  local count focused other
+  count=$(hyprctl monitors -j 2>/dev/null | jq 'length' 2>/dev/null || echo 1)
+  if (( count > 1 )); then
+    other=$(hyprctl monitors -j 2>/dev/null | jq -r '.[] | select(.focused != true) | .name' | head -n 1)
+    echo "${other:-}"
+  fi
+}
+
+case "${1:-}" in
+  status)
+    if is_recording; then
+      printf '{"recording":true,"elapsed":%d,"overlay":"%s"}\n' "$(elapsed_seconds)" "$(overlay_monitor)"
+    else
+      printf '{"recording":false,"elapsed":0,"overlay":""}\n'
+    fi
+    ;;
+  record)
+    case "${2:-toggle}" in
+      toggle)
+        exec omarchy-capture-screenrecording --with-desktop-audio
+        ;;
+      stop)
+        exec omarchy-capture-screenrecording --stop-recording
+        ;;
+      *)
+        echo "usage: cornerstone-capture record [toggle|stop]" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  clip)
+    if has_clips_service && systemctl --user is-active --quiet cornerstone-clips.service; then
+      systemctl --user kill -s SIGUSR1 cornerstone-clips.service
+    else
+      toast "Replay buffer unavailable" "This device uses on-demand screen recording" "󰕧" "amber"
+    fi
+    ;;
+  clips)
+    if ! has_clips_service; then
+      toast "Replay buffer unavailable" "Install cornerstone-clips.service on a supported GPU" "󰕧" "amber"
+      exit 0
+    fi
+    if systemctl --user is-active --quiet cornerstone-clips.service; then
+      systemctl --user stop cornerstone-clips.service
+      toast "Replay buffer off" "Background clip buffer stopped" "󰕧" "dim"
+    else
+      systemctl --user start cornerstone-clips.service
+      toast "Replay buffer armed" "Background clip buffer active" "󰕧" "green"
+    fi
+    ;;
+  settings)
+    ensure_config
+    exec xdg-open "$CFG_FILE"
+    ;;
+  *)
+    echo "usage: cornerstone-capture status | record [toggle|stop] | clip [save] | clips [toggle] | settings" >&2
+    exit 1
+    ;;
+esac

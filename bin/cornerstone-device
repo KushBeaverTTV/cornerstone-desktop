@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Device discovery & hardware profile generator for the Cornerstone Omarchy suite.
+
+Inspects architecture, chassis (laptop vs desktop), GPU vendor/VRAM backend,
+monitor geometry, capture backend, installed Chromium-family browsers, audio/mount
+hardware, and systemd user services, then emits a machine-readable JSON profile
+(or a human-readable summary with --human).
+"""
+import glob
+import json
+import os
+import platform
+import shutil
+import socket
+import subprocess
+import sys
+
+
+HOME = os.path.expanduser("~")
+SYSTEMD_USER_DIRS = [
+    os.path.join(HOME, ".config/systemd/user"),
+    "/etc/systemd/user",
+    "/usr/lib/systemd/user",
+]
+
+BROWSER_SPECS = [
+    ("google-chrome", ["google-chrome-stable", "google-chrome"], os.path.join(HOME, ".config/google-chrome")),
+    ("chromium", ["chromium", "chromium-browser"], os.path.join(HOME, ".config/chromium")),
+    ("brave", ["brave", "brave-browser"], os.path.join(HOME, ".config/BraveSoftware/Brave-Browser")),
+    ("vivaldi", ["vivaldi-stable", "vivaldi"], os.path.join(HOME, ".config/vivaldi")),
+    ("edge", ["microsoft-edge-stable", "microsoft-edge"], os.path.join(HOME, ".config/microsoft-edge")),
+]
+
+CORNERSTONE_PLUGINS = [
+    ("cornerstone-dictation", "cornerstone.panel"),
+    ("cornerstone-stats", "cornerstone.stats"),
+    ("cornerstone-island", "cornerstone.island"),
+    ("cornerstone-phones", "cornerstone.phones"),
+    ("cornerstone-audio", "cornerstone.audio"),
+    ("cornerstone-muse", "cornerstone.muse"),
+    ("cornerstone-discord", "cornerstone.discord"),
+    ("cornerstone-hq-widget", "cornerstone.hq"),
+    ("cornerstone-gpu", "cornerstone.gpu"),
+    ("cornerstone-capture", "cornerstone.capture"),
+    ("cornerstone-rig", "cornerstone.rig"),
+    ("cornerstone-worktrees", "cornerstone.worktrees"),
+    ("cornerstone-parked", "cornerstone.parked"),
+]
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read().replace(b"\x00", b"").decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def read_int(path):
+    try:
+        return int(read_text(path))
+    except Exception:
+        return 0
+
+
+def run_cmd(argv, timeout=2.0):
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip()
+    except Exception:
+        return 1, ""
+
+
+def unit_exists(name):
+    fname = name if name.endswith(".service") else f"{name}.service"
+    for d in SYSTEMD_USER_DIRS:
+        if os.path.exists(os.path.join(d, fname)):
+            return True
+    return False
+
+
+def unit_active(name):
+    fname = name if name.endswith(".service") else f"{name}.service"
+    rc, out = run_cmd(["systemctl", "--user", "is-active", fname], timeout=1.5)
+    return rc == 0 and out == "active"
+
+
+def unit_enabled_or_active(name):
+    fname = name if name.endswith(".service") else f"{name}.service"
+    if unit_active(fname):
+        return True
+    rc, out = run_cmd(["systemctl", "--user", "is-enabled", fname], timeout=1.5)
+    return rc == 0 and out in ("enabled", "static", "indirect")
+
+
+def detect_model():
+    for path in (
+        "/proc/device-tree/model",
+        "/sys/devices/virtual/dmi/id/product_name",
+        "/sys/class/dmi/id/product_name",
+    ):
+        val = read_text(path)
+        if val and val.lower() not in ("to be filled by o.e.m.", "system product name", "default string"):
+            return val
+    return socket.gethostname()
+
+
+def detect_battery():
+    for p in glob.glob("/sys/class/power_supply/*/type"):
+        if read_text(p).lower() == "battery":
+            return True
+    return False
+
+
+def detect_chassis(has_battery):
+    chassis_type = read_int("/sys/class/dmi/id/chassis_type")
+    if chassis_type in (8, 9, 10, 11, 14, 30, 31, 32):
+        return "laptop"
+    if has_battery:
+        return "laptop"
+    return "desktop"
+
+
+def detect_drm_drivers():
+    drivers = []
+    compat = []
+    for p in sorted(glob.glob("/sys/class/drm/card*/device/uevent")):
+        txt = read_text(p)
+        for line in txt.splitlines():
+            if line.startswith("DRIVER="):
+                drv = line.split("=", 1)[1].strip()
+                if drv and drv not in drivers:
+                    drivers.append(drv)
+            elif line.startswith("OF_COMPATIBLE_0="):
+                c = line.split("=", 1)[1].strip()
+                if c and c not in compat:
+                    compat.append(c)
+    return drivers, compat
+
+
+def detect_gpu():
+    drivers, compat = detect_drm_drivers()
+
+    # 1. AMD / discrete DRM sysfs VRAM
+    best_vram = 0
+    for path in sorted(glob.glob("/sys/class/drm/card*/device/mem_info_vram_total")):
+        total = read_int(path)
+        if total > best_vram:
+            best_vram = total
+    if best_vram > 0:
+        vendor = "amd" if "amdgpu" in drivers else (drivers[0] if drivers else "drm")
+        return {
+            "vendor": vendor,
+            "model": vendor.upper() + " GPU",
+            "backend": "amd" if vendor == "amd" else "drm",
+            "hasDiscreteVram": True,
+            "unified": False,
+            "vramTotalMb": round(best_vram / (1024 * 1024)),
+        }
+
+    # 2. NVIDIA via nvidia-smi
+    if shutil.which("nvidia-smi"):
+        rc, out = run_cmd([
+            "nvidia-smi",
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ], timeout=2.5)
+        if rc == 0 and out:
+            line = out.splitlines()[0]
+            parts = [p.strip() for p in line.split(",")]
+            name = parts[0] if parts else "NVIDIA GPU"
+            vram = int(float(parts[1])) if len(parts) > 1 and parts[1].replace(".", "", 1).isdigit() else 0
+            return {
+                "vendor": "nvidia",
+                "model": name,
+                "backend": "nvidia",
+                "hasDiscreteVram": vram > 0,
+                "unified": vram == 0,
+                "vramTotalMb": vram,
+            }
+
+    # 3. Apple Silicon (Asahi AGX)
+    if any(d in ("asahi", "apple-drm") for d in drivers) or any("apple," in c for c in compat):
+        agx = next((c for c in compat if "agx" in c), "")
+        label = f"Apple Silicon ({agx.split(',', 1)[-1]})" if agx else "Apple Silicon"
+        return {
+            "vendor": "apple",
+            "model": label,
+            "backend": "unified",
+            "hasDiscreteVram": False,
+            "unified": True,
+            "vramTotalMb": 0,
+        }
+
+    # 4. Intel / generic unified
+    if any(d in ("i915", "xe") for d in drivers):
+        return {
+            "vendor": "intel",
+            "model": "Intel Graphics",
+            "backend": "unified",
+            "hasDiscreteVram": False,
+            "unified": True,
+            "vramTotalMb": 0,
+        }
+
+    return {
+        "vendor": drivers[0] if drivers else "unknown",
+        "model": drivers[0] if drivers else "Integrated GPU",
+        "backend": "unified",
+        "hasDiscreteVram": False,
+        "unified": True,
+        "vramTotalMb": 0,
+    }
+
+
+def detect_monitors():
+    rc, out = run_cmd(["hyprctl", "monitors", "-j"], timeout=2.0)
+    if rc != 0 or not out:
+        return {"count": 1, "primary": "", "maxLogicalWidth": 1920, "isCompact": False}
+    try:
+        mons = json.loads(out)
+    except Exception:
+        return {"count": 1, "primary": "", "maxLogicalWidth": 1920, "isCompact": False}
+    if not isinstance(mons, list) or not mons:
+        return {"count": 1, "primary": "", "maxLogicalWidth": 1920, "isCompact": False}
+
+    max_w = 0
+    primary = ""
+    for m in mons:
+        w = float(m.get("width") or 0)
+        scale = float(m.get("scale") or 1.0) or 1.0
+        transform = int(m.get("transform") or 0)
+        if transform in (1, 3, 5, 7):
+            w = float(m.get("height") or 0)
+        logical_w = int(round(w / scale))
+        if logical_w > max_w:
+            max_w = logical_w
+        if m.get("focused") or not primary:
+            primary = str(m.get("name") or "")
+    return {
+        "count": len(mons),
+        "primary": primary,
+        "maxLogicalWidth": max_w or 1920,
+        "isCompact": 0 < max_w <= 1650,
+    }
+
+
+def detect_browsers():
+    found = []
+    for name, bins, cfg_dir in BROWSER_SPECS:
+        exe = next((b for b in bins if shutil.which(b)), "")
+        has_profile = os.path.isfile(os.path.join(cfg_dir, "Local State"))
+        if exe or has_profile:
+            found.append({
+                "id": name,
+                "binary": exe,
+                "configDir": cfg_dir,
+                "nativeMessagingDir": os.path.join(cfg_dir, "NativeMessagingHosts"),
+            })
+    return found
+
+
+def detect_wave3():
+    alsa = False
+    cards = read_text("/proc/asound/cards").lower()
+    if any(k in cards for k in ("wave3", "wave:3", "elgato")):
+        alsa = True
+    usb = False
+    for p in glob.glob("/sys/bus/usb/devices/*/product"):
+        if "wave:3" in read_text(p).lower():
+            usb = True
+            break
+    return {
+        "alsa": alsa,
+        "usb": usb,
+        "resetScript": os.path.exists(os.path.join(HOME, "Work/reset-elgato-usb.sh")),
+    }
+
+
+def detect_storage_mount():
+    fstab = read_text("/etc/fstab")
+    return (
+        os.path.ismount("/mnt/storage")
+        or os.path.isdir("/mnt/storage")
+        or "/mnt/storage" in fstab
+    )
+
+
+def detect_project_roots():
+    candidates = [
+        os.path.join(HOME, d)
+        for d in ("Projects", "Work", "Code", "dev", "src")
+    ]
+    roots = []
+    seen = set()
+    for p in candidates:
+        if os.path.isdir(p):
+            rp = os.path.realpath(p)
+            if rp not in seen:
+                seen.add(rp)
+                roots.append(p)
+    return roots
+
+
+def recommend(profile):
+    gpu = profile["gpu"]
+    services = profile["services"]
+    monitors = profile["monitors"]
+
+    enabled = [
+        "cornerstone.panel",
+        "cornerstone.stats",
+        "cornerstone.island",
+        "cornerstone.phones",
+        "cornerstone.audio",
+        "cornerstone.muse",
+        "cornerstone.discord",
+        "cornerstone.capture",
+        "cornerstone.worktrees",
+        "cornerstone.parked",
+        "cornerstone.rig",
+    ]
+    disabled = []
+
+    if gpu["hasDiscreteVram"]:
+        enabled.append("cornerstone.gpu")
+    else:
+        disabled.append("cornerstone.gpu")
+
+    if services["hq"]:
+        enabled.append("cornerstone.hq")
+    else:
+        disabled.append("cornerstone.hq")
+
+    stats_tabs = ["apps", "cpu"]
+    if gpu["hasDiscreteVram"]:
+        stats_tabs.append("gpu")
+    stats_tabs.extend(["memory", "disks", "network", "sensors", "power", "services"])
+
+    bar_mode = "compact" if (monitors["isCompact"] or profile["chassis"] == "laptop") else "full"
+    dictation_engine = "qwen" if services["localStt"] else "mistral"
+
+    return {
+        "enabledPlugins": enabled,
+        "disabledPlugins": disabled,
+        "barMode": bar_mode,
+        "statsTabs": ",".join(stats_tabs),
+        "dictationEngine": dictation_engine,
+    }
+
+
+def build_profile():
+    arch = platform.machine()
+    model = detect_model()
+    has_battery = detect_battery()
+    chassis = detect_chassis(has_battery)
+    gpu = detect_gpu()
+    is_apple_silicon = gpu["vendor"] == "apple" or (arch == "aarch64" and model.startswith("Mac"))
+    monitors = detect_monitors()
+    browsers = detect_browsers()
+    wave3 = detect_wave3()
+
+    gsr_supported = bool(shutil.which("gpu-screen-recorder")) and not is_apple_silicon and gpu["vendor"] in ("amd", "nvidia", "intel")
+    capture_backend = "gpu-screen-recorder" if gsr_supported else ("wf-recorder" if shutil.which("wf-recorder") else "omarchy")
+    clips_unit = unit_exists("cornerstone-clips")
+
+    services = {
+        "lanMouse": unit_exists("lan-mouse") or bool(shutil.which("lan-mouse")),
+        "sunshine": unit_exists("sunshine") or bool(shutil.which("sunshine")),
+        "onedrive": unit_exists("onedrive-mount"),
+        "localStt": gpu["hasDiscreteVram"] and (unit_enabled_or_active("cornerstone-stt-qwen") or unit_enabled_or_active("cornerstone-stt-gpu")),
+        "jarvis": unit_enabled_or_active("cornerstone-jarvis"),
+        "hq": unit_exists("kbp-server") or unit_exists("hq-bridge"),
+        "clips": clips_unit,
+        "powerProfiles": bool(shutil.which("powerprofilesctl")),
+    }
+
+    profile = {
+        "hostname": socket.gethostname(),
+        "arch": arch,
+        "model": model,
+        "chassis": chassis,
+        "isAppleSilicon": is_apple_silicon,
+        "gpu": gpu,
+        "monitors": monitors,
+        "capture": {
+            "backend": capture_backend,
+            "replayBufferSupported": gsr_supported and clips_unit,
+        },
+        "browsers": browsers,
+        "projectRoots": detect_project_roots(),
+        "hardware": {
+            "battery": has_battery,
+            "wave3": wave3["alsa"] or wave3["usb"] or wave3["resetScript"],
+            "wave3Alsa": wave3["alsa"],
+            "wave3Usb": wave3["usb"],
+            "storageMount": detect_storage_mount(),
+        },
+        "services": services,
+    }
+    profile["recommended"] = recommend(profile)
+    return profile
+
+
+def format_human(p):
+    lines = [
+        f"Device:   {p['model']} ({p['chassis']}, {p['arch']}, host={p['hostname']})",
+        f"GPU:      {p['gpu']['model']} [{p['gpu']['backend']}]"
+        + (f" ({p['gpu']['vramTotalMb']} MB VRAM)" if p['gpu']['hasDiscreteVram'] else " (unified memory)"),
+        f"Display:  {p['monitors']['count']} monitor(s), primary={p['monitors']['primary'] or '?'}, "
+        f"max width={p['monitors']['maxLogicalWidth']}px ({p['recommended']['barMode']} bar)",
+        f"Capture:  {p['capture']['backend']}"
+        + (" + replay buffer" if p['capture']['replayBufferSupported'] else " (no replay buffer)"),
+        f"Browsers: {', '.join(b['id'] for b in p['browsers']) or 'none detected'}",
+        f"Roots:    {', '.join(p['projectRoots']) or 'none'}",
+        f"Enable:   {', '.join(p['recommended']['enabledPlugins'])}",
+        f"Skip:     {', '.join(p['recommended']['disabledPlugins']) or 'none'}",
+    ]
+    return "\n".join(lines)
+
+
+def main():
+    profile = build_profile()
+    if "--human" in sys.argv:
+        print(format_human(profile))
+    else:
+        print(json.dumps(profile, indent=2))
+
+
+if __name__ == "__main__":
+    main()

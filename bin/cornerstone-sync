@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""cornerstone-sync — install/update Cornerstone Omarchy plugins and tailor
+~/.config/omarchy/shell.json to the discovered hardware profile.
+
+Usage:
+  cornerstone-sync                 # install missing Cornerstone plugins & update all
+  cornerstone-sync --configure     # also tailor shell.json for this device (backs up first)
+  cornerstone-sync --dry-run       # print detected profile and planned actions only
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+
+HOME = os.path.expanduser("~")
+PLUGINS_DIR = os.path.join(HOME, ".config/omarchy/plugins")
+SHELL_JSON = os.path.join(HOME, ".config/omarchy/shell.json")
+OWNER = "KushBeaverTTV"
+
+REPOS = [
+    ("cornerstone-dictation", "cornerstone.panel"),
+    ("cornerstone-stats", "cornerstone.stats"),
+    ("cornerstone-island", "cornerstone.island"),
+    ("cornerstone-phones", "cornerstone.phones"),
+    ("cornerstone-audio", "cornerstone.audio"),
+    ("cornerstone-muse", "cornerstone.muse"),
+    ("cornerstone-discord", "cornerstone.discord"),
+    ("cornerstone-hq-widget", "cornerstone.hq"),
+    ("cornerstone-gpu", "cornerstone.gpu"),
+    ("cornerstone-capture", "cornerstone.capture"),
+    ("cornerstone-rig", "cornerstone.rig"),
+    ("cornerstone-worktrees", "cornerstone.worktrees"),
+    ("cornerstone-parked", "cornerstone.parked"),
+]
+
+# Legacy/upstream plugins superseded by Cornerstone forks
+SUPERSEDED_MAP = {
+    "crmne.omastats": "cornerstone.stats",
+    "omarchy-dynamic-island": "cornerstone.island",
+    "io.github.ncr.omaphones": "cornerstone.phones",
+    "muse-agent": "cornerstone.muse",
+    "omarchy.audio": "cornerstone.audio",
+}
+
+TRAY_CANDIDATES = {
+    "io.github.twiking.omacontrol",
+    "io.github.twiking.omasettings",
+    "tahayvr.postcard",
+    "jankeesvw.time-machine",
+    "omarchy.keyboard-layout",
+    "omarchy.monitor",
+}
+
+
+def get_device_profile():
+    here = os.path.dirname(os.path.realpath(__file__))
+    cmd = os.path.join(here, "cornerstone-device")
+    if not os.path.exists(cmd):
+        cmd = "cornerstone-device"
+    r = subprocess.run([cmd], capture_output=True, text=True, check=True)
+    return json.loads(r.stdout)
+
+
+def sync_plugins(dry_run=False):
+    for repo, pid in REPOS:
+        target = os.path.join(PLUGINS_DIR, pid)
+        url = f"https://github.com/{OWNER}/{repo}.git"
+        if os.path.isdir(os.path.join(target, ".git")):
+            print(f"[update] {pid}")
+            if not dry_run:
+                subprocess.run(["omarchy", "plugin", "update", pid, "--yes"], check=False)
+        else:
+            print(f"[add]    {pid} <- {url}")
+            if not dry_run:
+                if os.path.isdir(target):
+                    bak = os.path.join(HOME, f".local/share/cornerstone-backup-{int(time.time())}")
+                    os.makedirs(bak, exist_ok=True)
+                    shutil.move(target, os.path.join(bak, pid))
+                    subprocess.run(["omarchy-shell", "shell", "rescanPlugins"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["omarchy", "plugin", "add", url, "--yes"], check=False)
+
+
+def upsert_entry(lst, entry_id, defaults=None, after_id=None, before_id=None):
+    for item in lst:
+        if item.get("id") == entry_id:
+            if defaults:
+                for k, v in defaults.items():
+                    item.setdefault(k, v)
+            return
+    obj = {"id": entry_id}
+    if defaults:
+        obj.update(defaults)
+    if after_id:
+        for i, item in enumerate(lst):
+            if item.get("id") == after_id:
+                lst.insert(i + 1, obj)
+                return
+    if before_id:
+        for i, item in enumerate(lst):
+            if item.get("id") == before_id:
+                lst.insert(i, obj)
+                return
+    lst.append(obj)
+
+
+def remove_entry(lst, entry_id):
+    lst[:] = [x for x in lst if x.get("id") != entry_id]
+
+
+def configure_shell(profile, dry_run=False):
+    if not os.path.isfile(SHELL_JSON):
+        print(f"Skipping shell.json configuration ({SHELL_JSON} not found)")
+        return
+
+    with open(SHELL_JSON) as f:
+        cfg = json.load(f)
+
+    rec = profile["recommended"]
+    bar = cfg.setdefault("bar", {})
+    layout = bar.setdefault("layout", {})
+    left = layout.setdefault("left", [])
+    right = layout.setdefault("right", [])
+    tray = layout.setdefault("tray", [])
+    plugins = cfg.setdefault("plugins", [])
+
+    # 1. Replace superseded IDs in-place
+    for section in (left, right, tray, plugins):
+        for item in section:
+            old_id = item.get("id")
+            if old_id in SUPERSEDED_MAP:
+                item["id"] = SUPERSEDED_MAP[old_id]
+
+    # 2. Tune cornerstone.stats for this device
+    stats_defaults = {
+        "barGpus": "discrete" if profile["gpu"]["hasDiscreteVram"] else "none",
+        "barLabels": "icon",
+        "cpuStyle": "text",
+        "graphWidth": 24,
+        "memoryStyle": "text",
+        "modules": "cpu,memory",
+        "showGpuMemory": False,
+        "style": "text",
+        "tabs": rec["statsTabs"],
+        "utilizationColors": False,
+    }
+    upsert_entry(left, "cornerstone.stats", stats_defaults)
+    for item in left:
+        if item.get("id") == "cornerstone.stats":
+            item["tabs"] = rec["statsTabs"]
+            if not profile["gpu"]["hasDiscreteVram"]:
+                item["barGpus"] = "none"
+                item["showGpuMemory"] = False
+
+    # 3. Left bar: cornerstone.gpu (only with discrete VRAM) & cornerstone.parked
+    if "cornerstone.gpu" in rec["enabledPlugins"]:
+        upsert_entry(left, "cornerstone.gpu", after_id="cornerstone.stats")
+    else:
+        remove_entry(left, "cornerstone.gpu")
+        remove_entry(right, "cornerstone.gpu")
+
+    upsert_entry(left, "cornerstone.parked")
+
+    # 4. Right bar: Cornerstone widgets
+    for pid in ("cornerstone.panel", "cornerstone.capture", "cornerstone.worktrees",
+                "cornerstone.discord", "cornerstone.rig", "cornerstone.phones",
+                "cornerstone.muse", "cornerstone.audio"):
+        if pid in rec["enabledPlugins"]:
+            if not any(x.get("id") == pid for x in right + tray):
+                upsert_entry(right, pid, before_id="omarchy.bluetooth")
+
+    if "cornerstone.hq" in rec["enabledPlugins"]:
+        if not any(x.get("id") == "cornerstone.hq" for x in right + tray):
+            upsert_entry(right, "cornerstone.hq", after_id="cornerstone.panel")
+    else:
+        remove_entry(right, "cornerstone.hq")
+        remove_entry(tray, "cornerstone.hq")
+
+    # 5. Compact bar mode on laptops / <= 1650px displays: move secondary widgets to tray drawer
+    if rec["barMode"] == "compact":
+        moved = [x for x in right if x.get("id") in TRAY_CANDIDATES]
+        right[:] = [x for x in right if x.get("id") not in TRAY_CANDIDATES]
+        existing_tray = {x.get("id") for x in tray}
+        for item in moved:
+            if item.get("id") not in existing_tray:
+                tray.append(item)
+
+    # 6. Ensure cornerstone.island is enabled in plugins[]
+    if not any(x.get("id") == "cornerstone.island" for x in plugins):
+        plugins.insert(0, {"id": "cornerstone.island", "style": "notch", "idle": "pill"})
+
+    if dry_run:
+        print(f"[dry-run] Would write tailored {SHELL_JSON} (barMode={rec['barMode']})")
+        return
+
+    bak = f"{SHELL_JSON}.bak.{int(time.time())}"
+    shutil.copy2(SHELL_JSON, bak)
+    with open(SHELL_JSON, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    print(f"Configured {SHELL_JSON} for {profile['model']} ({rec['barMode']} bar; backup: {bak})")
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    do_configure = "--configure" in sys.argv
+    profile = get_device_profile()
+    print(f"Detected: {profile['model']} ({profile['chassis']}, {profile['arch']}, gpu={profile['gpu']['backend']}, bar={profile['recommended']['barMode']})")
+    sync_plugins(dry_run=dry_run)
+    if do_configure:
+        configure_shell(profile, dry_run=dry_run)
+
+
+if __name__ == "__main__":
+    main()

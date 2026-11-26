@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
-# webapp-chrome URL — open URL as an app window in Google Chrome.
-# Omarchy's own web-app launcher can't (it misreads Chrome's desktop entry and
-# Firefox, the default browser, can't do app windows). Added 2026-11-11.
+# webapp-chrome URL — open URL as an app window in the first available
+# Chromium-family browser (Chrome, Chromium, Brave, Vivaldi, Edge).
+# Omarchy's own web-app launcher can't (Firefox can't do app windows).
 [[ -n ${1:-} ]] || { echo "usage: webapp-chrome URL" >&2; exit 1; }
-if ! omarchy-cmd-browser-handoff google-chrome-stable --app="$1" "${@:2}" 2>/dev/null; then
-  exec setsid uwsm-app -- google-chrome-stable --app="$1" "${@:2}"
+
+browser=""
+for candidate in google-chrome-stable google-chrome chromium chromium-browser brave brave-browser vivaldi-stable microsoft-edge-stable; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    browser="$candidate"
+    break
+  fi
+done
+
+if [[ -z $browser ]]; then
+  echo "webapp-chrome: no Chromium-family browser found on PATH" >&2
+  exit 1
+fi
+
+if ! omarchy-cmd-browser-handoff "$browser" --app="$1" "${@:2}" 2>/dev/null; then
+  exec setsid uwsm-app -- "$browser" --app="$1" "${@:2}"
 fi
